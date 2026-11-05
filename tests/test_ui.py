@@ -421,3 +421,58 @@ def test_activity_action_stays_disabled_during_media_probe(
     assert not window.analyze_activity_button.isEnabled()
     window._set_busy(False)
     assert window.analyze_activity_button.isEnabled()
+
+
+def test_window_import_unicode_video_populates_media_info_and_reports_probe_errors(
+    qtbot, tmp_path: Path, monkeypatch
+) -> None:
+    from types import SimpleNamespace
+    from codesound_sync.services import ffmpeg_service
+
+    video = tmp_path / "How To Use Primary Keys In MySQL Workbench 🥶.mp4"
+    video.write_bytes(b"synthetic video")
+    monkeypatch.setattr(ffmpeg_service, "get_ffprobe_path", lambda: Path("ffprobe.exe"))
+    monkeypatch.setattr(
+        ffmpeg_service.subprocess,
+        "run",
+        lambda *args, **kwargs: SimpleNamespace(
+            returncode=0,
+            stdout=(
+                '{"format":{"filename":"How To Use Primary Keys In MySQL Workbench 🥶.mp4",'
+                '"duration":"95.0","size":"4096","bit_rate":"1200000"},'
+                '"streams":[{"codec_type":"video","width":1920,"height":1080,'
+                '"r_frame_rate":"30/1","codec_name":"h264"},'
+                '{"codec_type":"audio","codec_name":"aac"}]}'
+            ),
+            stderr="",
+        ),
+    )
+
+    window = MainWindow()
+    qtbot.addWidget(window)
+    window.load_video(video)
+    qtbot.waitUntil(lambda: window._probe_worker is None, timeout=3000)
+
+    assert window.workspace_panel._path.text() == str(video)
+    assert window.media_info_panel._duration.value_label.text() == "00:01:35"
+    assert window.media_info_panel._resolution.value_label.text() == "1920×1080"
+    assert window.media_info_panel._fps.value_label.text() == "30.00 fps"
+    assert window.media_info_panel._video_codec.value_label.text() == "h264"
+    assert window.media_info_panel._audio_streams.value_label.text() == "1 (aac)"
+    assert window.analyze_button.isEnabled()
+
+    monkeypatch.setattr(
+        ffmpeg_service.subprocess,
+        "run",
+        lambda *args, **kwargs: SimpleNamespace(
+            returncode=0, stdout=None, stderr=""
+        ),
+    )
+    window.load_video(video)
+    qtbot.waitUntil(lambda: window._probe_worker is None, timeout=3000)
+
+    log_text = window.status_panel.findChild(QPlainTextEdit).toPlainText()
+    assert "returned no media metadata output" in log_text
+    assert "TypeError" not in log_text
+    assert window.statusBar().currentMessage() == "Media inspection failed"
+    assert not window.analyze_button.isEnabled()

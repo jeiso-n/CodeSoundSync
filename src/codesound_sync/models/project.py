@@ -19,6 +19,7 @@ from pathlib import Path
 from typing import Optional
 
 from codesound_sync.models.media_info import MediaInfo
+from codesound_sync.models.timeline_event import TimelineEvent
 
 
 def _utcnow_iso() -> str:
@@ -33,6 +34,7 @@ class Project:
     source_video: Optional[Path] = None
     output_dir: Optional[Path] = None
     media_info: Optional[MediaInfo] = None
+    timeline_events: list[TimelineEvent] = field(default_factory=list)
 
     # Automatically assigned
     project_id: str = field(default_factory=lambda: str(uuid.uuid4()))
@@ -58,6 +60,7 @@ class Project:
             "source_video": str(self.source_video) if self.source_video else None,
             "output_dir": str(self.output_dir) if self.output_dir else None,
             "media_info": self.media_info.to_dict() if self.media_info else None,
+            "timeline_events": [event.to_dict() for event in self.timeline_events],
             "created_at": self.created_at,
             "modified_at": self.modified_at,
         }
@@ -89,11 +92,20 @@ class Project:
             raise ValueError("Project media information must be an object or null.")
         media_info = MediaInfo.from_dict(media_raw) if media_raw is not None else None
 
+        events_raw = data.get("timeline_events")
+        if events_raw is None:
+            timeline_events: list[TimelineEvent] = []
+        elif isinstance(events_raw, list):
+            timeline_events = [TimelineEvent.from_dict(item) for item in events_raw]
+        else:
+            raise ValueError("Project timeline_events must be a list or null.")
+
         return cls(
             name=name,
             source_video=Path(data["source_video"]) if data.get("source_video") else None,
             output_dir=Path(data["output_dir"]) if data.get("output_dir") else None,
             media_info=media_info,
+            timeline_events=timeline_events,
             project_id=project_id,
             created_at=data.get("created_at", _utcnow_iso()),
             modified_at=data.get("modified_at", _utcnow_iso()),

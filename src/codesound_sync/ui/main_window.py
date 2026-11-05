@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from dataclasses import replace
 import logging
 from pathlib import Path
 from uuid import uuid4
@@ -37,9 +38,20 @@ from codesound_sync.models.activity_candidate import (
     candidates_to_sound_events,
 )
 from codesound_sync.models.project import Project
+from codesound_sync.models.timeline_event import (
+    EventClassification,
+    EventSource,
+    TimelineEvent,
+    candidates_to_timeline_events,
+    timeline_events_to_sound_events,
+)
 from codesound_sync.services.project_service import ProjectFileError, ProjectService
 from codesound_sync.services.activity_analysis_service import FrameActivityAnalyzer
 from codesound_sync.services.sound_effects_service import SoundEffectsService
+from codesound_sync.services.sound_preview_service import (
+    SoundPreviewError,
+    SoundPreviewService,
+)
 from codesound_sync.ui.dialogs.activity_review_dialog import ActivityReviewDialog
 from codesound_sync.ui.panels.media_info_panel import MediaInfoPanel
 from codesound_sync.ui.panels.status_panel import StatusPanel
@@ -57,7 +69,7 @@ PROJECT_FILTER = "CodeSound Sync project files (*.json)"
 
 
 class MainWindow(QMainWindow):
-    """Stage 1 and 2 window for local video projects and sound-effects demos."""
+    """Main desktop workstation for local video projects and sound synchronization."""
 
     def __init__(self, parent=None) -> None:
         super().__init__(parent)
@@ -66,6 +78,7 @@ class MainWindow(QMainWindow):
 
         self._project_service = ProjectService()
         self._sound_effects_service = SoundEffectsService()
+        self._sound_preview_service = SoundPreviewService(self._sound_effects_service)
         self._project: Project | None = None
         self._project_file: Path | None = None
         self._probe_worker: FFprobeWorker | None = None
@@ -122,6 +135,28 @@ class MainWindow(QMainWindow):
         content = QSplitter(Qt.Horizontal)
         content.setChildrenCollapsible(False)
         self.workspace_panel = WorkspacePanel()
+        self.workspace_panel.playback_error.connect(self._on_playback_error)
+        self.workspace_panel.timeline_widget.event_selected.connect(
+            self.workspace_panel.event_inspector.set_event
+        )
+        self.workspace_panel.timeline_widget.event_moved.connect(
+            self._on_timeline_event_moved
+        )
+        self.workspace_panel.event_inspector.add_event_requested.connect(
+            self._add_timeline_event_at_playhead
+        )
+        self.workspace_panel.event_inspector.delete_event_requested.connect(
+            self._delete_timeline_event
+        )
+        self.workspace_panel.event_inspector.event_modified.connect(
+            self._on_inspector_event_modified
+        )
+        self.workspace_panel.event_inspector.preview_sound_requested.connect(
+            self._on_preview_sound_requested
+        )
+        self.workspace_panel.event_inspector.export_timeline_requested.connect(
+            self._export_timeline_sounds
+        )
         self.media_info_panel = MediaInfoPanel()
         self.media_info_panel.setMinimumWidth(290)
 
@@ -212,10 +247,18 @@ class MainWindow(QMainWindow):
                 color: #aab3c1; font-size: 15px;
             }
             QLabel#selectedMediaPath { color: #aab3c1; }
-            QLineEdit, QPlainTextEdit {
-                background: #151922; border: 1px solid #3a4351; border-radius: 5px;
-                color: #e6e9ef; padding: 7px;
+            QWidget#eventInspectorPanel {
+                background: #151922; border: 1px solid #303846; border-radius: 6px;
             }
+            QLineEdit, QPlainTextEdit, QComboBox, QDoubleSpinBox {
+                background: #151922; border: 1px solid #3a4351; border-radius: 5px;
+                color: #e6e9ef; padding: 5px 7px;
+            }
+            QComboBox:disabled, QDoubleSpinBox:disabled {
+                color: #727c8a; background: #1c212c;
+            }
+            QCheckBox { color: #e6e9ef; spacing: 6px; }
+            QCheckBox:disabled { color: #727c8a; }
             QPushButton {
                 background: #303846; border: 1px solid #465164; border-radius: 5px;
                 color: #f0f3f8; padding: 8px 12px;
@@ -285,8 +328,15 @@ class MainWindow(QMainWindow):
 
         if project.media_info is not None:
             self.media_info_panel.update_info(project.media_info)
+            self.workspace_panel.set_duration(
+                project.media_info.duration_seconds,
+                load_initial_frame=source_exists,
+            )
         else:
             self.media_info_panel.clear_info()
+            self.workspace_panel.set_duration(None, load_initial_frame=False)
+
+        self.workspace_panel.set_timeline_events(project.timeline_events)
 
         self.analyze_button.setEnabled(project.media_info is not None)
         self._update_activity_button()
@@ -325,6 +375,8 @@ class MainWindow(QMainWindow):
         self._project_file = None
         self.project_name.setText(self._project.name)
         self.workspace_panel.set_video(path)
+        self.workspace_panel.set_duration(None, load_initial_frame=False)
+        self.workspace_panel.set_timeline_events(())
         self.media_info_panel.clear_info()
         self.analyze_button.setEnabled(False)
         self.save_project_button.setEnabled(True)
@@ -377,6 +429,9 @@ class MainWindow(QMainWindow):
         self._project.media_info = info
         self._project.touch()
         self.media_info_panel.update_info(info)
+        self.workspace_panel.set_duration(
+            info.duration_seconds, load_initial_frame=True
+        )
         self.analyze_button.setEnabled(True)
         self.save_project_button.setEnabled(True)
         self.status_panel.success(
@@ -389,9 +444,14 @@ class MainWindow(QMainWindow):
 
     def _on_probe_error(self, message: str) -> None:
         self.media_info_panel.clear_info()
+        self.workspace_panel.set_duration(None, load_initial_frame=False)
         self.analyze_button.setEnabled(False)
         self.status_panel.error(message)
         self.statusBar().showMessage("Media inspection failed")
+
+    def _on_playback_error(self, message: str) -> None:
+        self.status_panel.warning(f"Video preview failed: {message}")
+        self.statusBar().showMessage("Video preview failed")
 
     def _on_worker_finished(self, worker: FFprobeWorker) -> None:
         if self._probe_worker is worker:
@@ -523,6 +583,19 @@ class MainWindow(QMainWindow):
         self.status_panel.success(summary)
         self.statusBar().showMessage(summary)
         self._activity_result = result
+        if self._project is not None:
+            self._project.timeline_events = candidates_to_timeline_events(
+                result.candidates
+            )
+            self._project.touch()
+            if (
+                self.workspace_panel.duration_seconds <= 0.0
+                and result.video_duration_seconds > 0.0
+            ):
+                self.workspace_panel.set_duration(
+                    result.video_duration_seconds, load_initial_frame=False
+                )
+            self.workspace_panel.set_timeline_events(self._project.timeline_events)
         dialog = ActivityReviewDialog(result, self)
         dialog.generate_requested.connect(self._generate_activity_sounds)
         self._review_dialog = dialog
@@ -554,6 +627,14 @@ class MainWindow(QMainWindow):
     def _generate_activity_sounds(
         self, candidates: tuple[ActivityCandidate, ...]
     ) -> None:
+        if self._project is not None and self._activity_result is not None:
+            self._project.timeline_events = candidates_to_timeline_events(
+                self._activity_result.candidates,
+                selected_candidates=candidates,
+            )
+            self._project.touch()
+            self.workspace_panel.set_timeline_events(self._project.timeline_events)
+
         events = candidates_to_sound_events(candidates)
         if not events:
             self.status_panel.warning(
@@ -568,6 +649,149 @@ class MainWindow(QMainWindow):
             if self._activity_result is not None
             else None
         )
+        self._render_sound_events_track(events, duration_seconds=duration_seconds)
+
+    def _ensure_project(self) -> Project:
+        if self._project is None:
+            self._project = Project(
+                name=self.project_name.text().strip() or "Untitled Project",
+                output_dir=Path(self.output_location.text()),
+            )
+            self.project_name.setText(self._project.name)
+            self.save_project_button.setEnabled(True)
+        return self._project
+
+    def _add_timeline_event_at_playhead(self) -> None:
+        project = self._ensure_project()
+        playhead = round(max(0.0, self.workspace_panel.current_seconds), 3)
+        new_event = TimelineEvent(
+            timestamp_seconds=playhead,
+            classification=EventClassification.KEYBOARD_TAP,
+            enabled=True,
+            source=EventSource.MANUAL,
+            confidence=None,
+            evidence="Manually added on timeline",
+            intensity=0.7,
+            variation=0.0,
+        )
+        project.timeline_events.append(new_event)
+        project.timeline_events.sort(
+            key=lambda item: (item.timestamp_seconds, item.event_id)
+        )
+        project.touch()
+        self.workspace_panel.set_timeline_events(
+            project.timeline_events, selected_event_id=new_event.event_id
+        )
+        self.status_panel.info(
+            f"Added {new_event.classification.label} event at {playhead:.2f}s."
+        )
+        self.statusBar().showMessage(f"Added event at {playhead:.2f}s")
+
+    def _delete_timeline_event(self, event_id: str) -> None:
+        if self._project is None:
+            return
+        before_count = len(self._project.timeline_events)
+        self._project.timeline_events = [
+            item for item in self._project.timeline_events if item.event_id != event_id
+        ]
+        if len(self._project.timeline_events) == before_count:
+            return
+        self._project.touch()
+        self.workspace_panel.set_timeline_events(
+            self._project.timeline_events, selected_event_id=None
+        )
+        self.status_panel.info("Deleted selected timeline event.")
+        self.statusBar().showMessage("Timeline event deleted")
+
+    def _on_timeline_event_moved(
+        self, event_id: str, new_timestamp: float
+    ) -> None:
+        if self._project is None:
+            return
+        clamped_ts = round(max(0.0, float(new_timestamp)), 3)
+        updated_list: list[TimelineEvent] = []
+        for item in self._project.timeline_events:
+            if item.event_id == event_id:
+                updated_list.append(replace(item, timestamp_seconds=clamped_ts))
+            else:
+                updated_list.append(item)
+        updated_list.sort(key=lambda item: (item.timestamp_seconds, item.event_id))
+        self._project.timeline_events = updated_list
+        self._project.touch()
+        self.workspace_panel.set_timeline_events(
+            self._project.timeline_events, selected_event_id=event_id
+        )
+
+    def _on_inspector_event_modified(self, updated_event: TimelineEvent) -> None:
+        if self._project is None:
+            return
+        updated_list: list[TimelineEvent] = []
+        for item in self._project.timeline_events:
+            if item.event_id == updated_event.event_id:
+                updated_list.append(updated_event)
+            else:
+                updated_list.append(item)
+        updated_list.sort(key=lambda item: (item.timestamp_seconds, item.event_id))
+        self._project.timeline_events = updated_list
+        self._project.touch()
+        self.workspace_panel.set_timeline_events(
+            self._project.timeline_events, selected_event_id=updated_event.event_id
+        )
+
+    def _on_preview_sound_requested(
+        self, event: TimelineEvent, variation_override: float | None
+    ) -> None:
+        try:
+            self._sound_preview_service.preview_timeline_event(
+                event, variation_override=variation_override
+            )
+        except (SoundPreviewError, ValueError) as exc:
+            self.status_panel.warning(f"Could not preview sound effect: {exc}")
+            self.statusBar().showMessage("Sound preview unavailable")
+            return
+        var_value = (
+            event.variation if variation_override is None else float(variation_override)
+        )
+        msg = (
+            f"Previewed {event.classification.label} "
+            f"(intensity {event.intensity:.2f}, variation {var_value:+.2f})."
+        )
+        self.status_panel.info(msg)
+        self.statusBar().showMessage(msg)
+
+    def _export_timeline_sounds(self) -> None:
+        if self._project is None or not self._project.timeline_events:
+            self.status_panel.warning(
+                "No timeline events to export. Add or analyze events first."
+            )
+            self.statusBar().showMessage("No timeline events to export")
+            return
+
+        events = timeline_events_to_sound_events(self._project.timeline_events)
+        if not events:
+            self.status_panel.warning(
+                "No included candidates can be rendered. Uncertain visual activity "
+                "is excluded rather than converted into guessed input sounds."
+            )
+            self.statusBar().showMessage("No renderable activity candidates selected")
+            return
+
+        duration_seconds: float | None = None
+        if (
+            self._project.media_info is not None
+            and self._project.media_info.duration_seconds is not None
+        ):
+            duration_seconds = self._project.media_info.duration_seconds
+        elif self.workspace_panel.timeline_widget.effective_duration > 0.0:
+            duration_seconds = self.workspace_panel.timeline_widget.effective_duration
+        self._render_sound_events_track(events, duration_seconds=duration_seconds)
+
+    def _render_sound_events_track(
+        self,
+        events,
+        *,
+        duration_seconds: float | None,
+    ) -> None:
         output_path = (
             Path(self.output_location.text())
             / f"codesound-activity-{uuid4().hex}.wav"
@@ -601,6 +825,7 @@ class MainWindow(QMainWindow):
         self.statusBar().showMessage("Stage 1 media inspection complete")
 
     def closeEvent(self, event) -> None:  # noqa: N802
+        self.workspace_panel.shutdown()
         activity_worker = self._activity_worker
         if activity_worker is not None and activity_worker.isRunning():
             activity_worker.cancel()

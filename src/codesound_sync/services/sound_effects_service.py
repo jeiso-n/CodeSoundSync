@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import array
+import io
 import math
 import random
 import sys
@@ -189,6 +190,35 @@ class SoundEffectsService:
                 for frame in range(first_frame, last_frame):
                     mixed[frame - block_start] += samples[frame - start]
             yield mixed
+
+    def render_event_wav_bytes(self, event: SoundEvent) -> bytes:
+        """Synthesize a single *event* into an in-memory 16-bit mono PCM WAV buffer."""
+        if not isinstance(event, SoundEvent):
+            raise ValueError("Expected a SoundEvent instance.")
+        samples = self._generator.generate(
+            event.event_type,
+            intensity=event.intensity,
+            variation=event.variation,
+        )
+        peak = max((abs(sample) for sample in samples), default=0.0)
+        gain = 0.95 / peak if peak > 0.95 else 1.0
+        pcm = array.array(
+            "h",
+            (
+                max(-32768, min(32767, round(sample * gain * 32767)))
+                for sample in samples
+            ),
+        )
+        if sys.byteorder != "little":
+            pcm.byteswap()
+
+        buffer = io.BytesIO()
+        with wave.open(buffer, "wb") as wav_file:
+            wav_file.setnchannels(1)
+            wav_file.setsampwidth(2)
+            wav_file.setframerate(self.sample_rate)
+            wav_file.writeframesraw(pcm.tobytes())
+        return buffer.getvalue()
 
     @staticmethod
     def demo_events() -> tuple[SoundEvent, ...]:

@@ -70,6 +70,8 @@ def check_ffmpeg_available() -> tuple[bool, str]:
             [str(ffmpeg), "-version"],
             capture_output=True,
             text=True,
+            encoding="utf-8",
+            errors="replace",
             timeout=10,
         )
         first_line = result.stdout.splitlines()[0] if result.stdout else "unknown"
@@ -93,6 +95,7 @@ def probe_media(video_path: Path) -> MediaInfo:
     FileNotFoundError
         When *video_path* does not exist.
     """
+    video_path = Path(video_path)
     if not video_path.is_file():
         raise FileNotFoundError(f"Video file not found: {video_path}")
 
@@ -100,7 +103,7 @@ def probe_media(video_path: Path) -> MediaInfo:
 
     cmd = [
         str(ffprobe),
-        "-v", "quiet",
+        "-v", "error",
         "-print_format", "json",
         "-show_format",
         "-show_streams",
@@ -114,15 +117,20 @@ def probe_media(video_path: Path) -> MediaInfo:
             cmd,
             capture_output=True,
             text=True,
+            encoding="utf-8",
+            errors="replace",
             timeout=FFPROBE_TIMEOUT_SECONDS,
         )
-    except subprocess.TimeoutExpired:
-        raise MediaProbeError(f"ffprobe timed out after {FFPROBE_TIMEOUT_SECONDS}s")
+    except subprocess.TimeoutExpired as exc:
+        raise MediaProbeError(
+            f"ffprobe timed out after {FFPROBE_TIMEOUT_SECONDS}s"
+        ) from exc
     except OSError as exc:
         raise MediaProbeError(f"Failed to launch ffprobe: {exc}") from exc
 
     if result.returncode != 0:
-        details = result.stderr.strip()[:500]
+        stderr_text = result.stderr if isinstance(result.stderr, str) else ""
+        details = stderr_text.strip()[:500]
         if not details:
             details = "The file may be invalid, unsupported, or unreadable."
         raise MediaProbeError(
@@ -130,9 +138,13 @@ def probe_media(video_path: Path) -> MediaInfo:
             f"{result.returncode}):\n{details}"
         )
 
+    stdout_text = result.stdout if isinstance(result.stdout, str) else ""
+    if not stdout_text.strip():
+        raise MediaProbeError("ffprobe returned no media metadata output.")
+
     try:
-        data = json.loads(result.stdout)
-    except json.JSONDecodeError as exc:
+        data = json.loads(stdout_text)
+    except (json.JSONDecodeError, TypeError) as exc:
         raise MediaProbeError(f"Could not parse ffprobe JSON output: {exc}") from exc
 
     return _parse_probe_output(video_path, data)
