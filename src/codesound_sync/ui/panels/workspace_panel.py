@@ -273,7 +273,9 @@ class WorkspacePanel(QWidget):
         if worker is not None:
             self._frame_worker = None
             worker.cancel()
-            worker.wait(1500)
+            # Do not destroy the owning QWidget while its child QThread is running.
+            # FFmpeg operations have a bounded timeout, so this wait will finish.
+            worker.wait()
             worker.deleteLater()
         self.play_pause_button.setText("Play")
 

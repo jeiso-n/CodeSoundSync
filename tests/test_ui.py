@@ -46,6 +46,11 @@ def test_window_import_runs_probe_in_background(
     monkeypatch.setattr(ffprobe_worker, "probe_media", slow_probe)
     window = MainWindow()
     window._project_service = ProjectService(tmp_path / "projects")
+    # This test verifies background metadata probing, not video-frame decoding.
+    # The fixture is intentionally not a valid MP4, so keep the preview decoder out.
+    monkeypatch.setattr(
+        window.workspace_panel, "_request_frame_seek", lambda *args, **kwargs: None
+    )
     qtbot.addWidget(window)
     window.show()
 
