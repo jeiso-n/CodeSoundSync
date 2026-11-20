@@ -48,36 +48,66 @@ class SoundGenerator:
             raise ValueError("Event variation must be a finite number from -1 to 1.")
 
         if event_type is SoundEventType.KEYBOARD_TAP:
-            duration = 0.043 * (1.0 + 0.14 * variation)
-            frequency = 1_650.0 * (1.0 + 0.10 * variation)
-            decay = 0.0105
-            harmonics = ((1.0, 1.0), (2.15, 0.24), (0.53, 0.12))
+            duration = 0.048 * (1.0 + 0.14 * variation)
+            body_freq = 240.0 * (1.0 + 0.12 * variation)
+            click_freq = 2_250.0 * (1.0 + 0.10 * variation)
+            body_decay = 0.011
+            click_decay = 0.0045
+            noise_mix = 0.42
+            second_tap_delay = None
         elif event_type is SoundEventType.MOUSE_LEFT_CLICK:
-            duration = 0.058
-            frequency = 1_150.0
-            decay = 0.015
-            harmonics = ((1.0, 1.0), (1.82, 0.32), (0.48, 0.14))
+            duration = 0.060
+            body_freq = 320.0 * (1.0 + 0.08 * variation)
+            click_freq = 1_550.0 * (1.0 + 0.08 * variation)
+            body_decay = 0.010
+            click_decay = 0.004
+            noise_mix = 0.48
+            second_tap_delay = 0.016
         else:
-            duration = 0.073
-            frequency = 760.0
-            decay = 0.023
-            harmonics = ((1.0, 1.0), (1.61, 0.28), (2.47, 0.12))
+            duration = 0.072
+            body_freq = 210.0 * (1.0 + 0.08 * variation)
+            click_freq = 1_050.0 * (1.0 + 0.08 * variation)
+            body_decay = 0.014
+            click_decay = 0.0055
+            noise_mix = 0.44
+            second_tap_delay = 0.020
 
+        import random
+
+        rng = random.Random(
+            f"{event_type.value}:{round(float(variation), 4)}"
+        )
         frame_count = max(1, round(duration * self.sample_rate))
         samples: list[float] = []
         peak = 0.0
+        prev_noise = 0.0
         for frame in range(frame_count):
-            time_seconds = frame / self.sample_rate
-            attack = 1.0 - math.exp(-time_seconds * 900.0)
-            envelope = attack * math.exp(-time_seconds / decay)
-            tone = sum(
-                amplitude
-                * math.sin(
-                    2.0 * math.pi * frequency * multiplier * time_seconds
+            t = frame / self.sample_rate
+            raw_noise = rng.uniform(-1.0, 1.0)
+            # High-pass emphasize the noise transient so it sounds crisp, not muddy
+            crisp_noise = 0.5 * (raw_noise - prev_noise)
+            prev_noise = raw_noise
+
+            attack = 1.0 - math.exp(-t * 2_400.0)
+            body = math.sin(2.0 * math.pi * body_freq * t) * math.exp(-t / body_decay)
+            click = (
+                math.sin(2.0 * math.pi * click_freq * t)
+                + 0.35 * math.sin(2.0 * math.pi * (click_freq * 1.62) * t)
+            ) * math.exp(-t / click_decay)
+            transient = crisp_noise * math.exp(-t / (click_decay * 0.9))
+
+            sample = attack * (0.45 * body + 0.55 * click + noise_mix * transient)
+
+            if second_tap_delay is not None and t >= second_tap_delay:
+                t2 = t - second_tap_delay
+                release_attack = 1.0 - math.exp(-t2 * 2_200.0)
+                release_click = (
+                    math.sin(2.0 * math.pi * (click_freq * 0.85) * t2)
+                    * math.exp(-t2 / (click_decay * 0.8))
                 )
-                for multiplier, amplitude in harmonics
-            )
-            sample = tone * envelope
+                release_noise = crisp_noise * math.exp(-t2 / (click_decay * 0.7))
+                sample += 0.38 * release_attack * (release_click + 0.4 * release_noise)
+
             samples.append(sample)
             peak = max(peak, abs(sample))
 

@@ -14,6 +14,7 @@ from codesound_sync.models.timeline_event import (
     EventSource,
     TimelineEvent,
     candidates_to_timeline_events,
+    merge_detected_timeline_events,
     timeline_events_to_sound_events,
 )
 from codesound_sync.services.project_service import ProjectService
@@ -160,3 +161,63 @@ def test_sound_preview_service_renders_valid_wav_bytes_and_calls_player() -> Non
     )
     with pytest.raises(SoundPreviewError, match="reclassified"):
         preview.preview_timeline_event(uncertain)
+
+
+def test_burst_candidate_expands_to_multiple_timeline_events_and_preserves_edits() -> None:
+    burst = ActivityCandidate(
+        timestamp_seconds=1.0,
+        candidate_type=ActivityType.TYPING,
+        confidence=0.60,
+        evidence="3 nearby localized frame changes.",
+        change_count=3,
+        event_timestamps=(1.0, 1.5, 2.0),
+    )
+    expanded = candidates_to_timeline_events([burst])
+    assert [e.timestamp_seconds for e in expanded] == [1.0, 1.5, 2.0]
+    assert all(e.classification is EventClassification.KEYBOARD_TAP for e in expanded)
+    assert all(e.source is EventSource.DETECTED for e in expanded)
+
+    manual = TimelineEvent(
+        event_id="manual-1",
+        timestamp_seconds=3.0,
+        classification=EventClassification.MOUSE_LEFT_CLICK,
+        source=EventSource.MANUAL,
+    )
+    edited_detected = TimelineEvent(
+        event_id="edited-1",
+        timestamp_seconds=1.52,
+        classification=EventClassification.MOUSE_RIGHT_CLICK,
+        source=EventSource.DETECTED,
+        user_edited=True,
+    )
+    merged = merge_detected_timeline_events(
+        [manual, edited_detected, expanded[0]],
+        expanded,
+    )
+    # expanded[1] at 1.5s collides with edited_detected at 1.52s (within 0.05s) so it is skipped
+    assert [e.timestamp_seconds for e in merged] == [1.0, 1.52, 2.0, 3.0]
+    assert merged[1].event_id == "edited-1"
+    assert merged[3].event_id == "manual-1"
+
+
+def test_sound_preview_service_renders_mix_and_stops() -> None:
+    played: list[bytes] = []
+    stopped: list[bool] = []
+    preview = SoundPreviewService(
+        player=played.append,
+        stopper=lambda: stopped.append(True),
+    )
+    events = [
+        TimelineEvent(0.2, EventClassification.KEYBOARD_TAP),
+        TimelineEvent(0.6, EventClassification.MOUSE_LEFT_CLICK),
+    ]
+    wav_bytes = preview.preview_timeline_mix(events, duration_seconds=1.0)
+    assert len(played) == 1
+    with wave.open(io.BytesIO(wav_bytes), "rb") as wav_file:
+        assert wav_file.getnchannels() == 1
+        assert wav_file.getsampwidth() == 2
+        assert wav_file.getframerate() == 44_100
+        assert wav_file.getnframes() >= 44_100
+
+    preview.stop()
+    assert stopped == [True]

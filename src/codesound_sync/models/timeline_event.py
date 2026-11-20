@@ -58,6 +58,7 @@ class TimelineEvent:
     intensity: float = 0.7
     variation: float = 0.0
     event_id: str = field(default_factory=lambda: str(uuid.uuid4()))
+    user_edited: bool = False
 
     def __post_init__(self) -> None:
         if (
@@ -121,6 +122,8 @@ class TimelineEvent:
 
         if not isinstance(self.event_id, str) or not self.event_id.strip():
             raise ValueError("Timeline event ID must be a non-empty string.")
+        if not isinstance(self.user_edited, bool):
+            raise ValueError("Timeline event user_edited flag must be a boolean.")
 
     @property
     def is_renderable(self) -> bool:
@@ -144,6 +147,7 @@ class TimelineEvent:
         candidate: ActivityCandidate,
         *,
         enabled: bool | None = None,
+        timestamp_seconds: float | None = None,
     ) -> "TimelineEvent":
         """Create a detected TimelineEvent from an ActivityCandidate."""
         if not isinstance(candidate, ActivityCandidate):
@@ -156,7 +160,11 @@ class TimelineEvent:
         )
         intensity = round(min(0.7, max(0.25, float(candidate.confidence))), 4)
         return cls(
-            timestamp_seconds=candidate.timestamp_seconds,
+            timestamp_seconds=(
+                candidate.timestamp_seconds
+                if timestamp_seconds is None
+                else float(timestamp_seconds)
+            ),
             classification=classification,
             enabled=is_enabled,
             source=EventSource.DETECTED,
@@ -164,6 +172,7 @@ class TimelineEvent:
             evidence=candidate.evidence,
             intensity=intensity,
             variation=0.0,
+            user_edited=False,
         )
 
     def to_dict(self) -> dict:
@@ -177,6 +186,7 @@ class TimelineEvent:
             "evidence": self.evidence,
             "intensity": self.intensity,
             "variation": self.variation,
+            "user_edited": self.user_edited,
         }
 
     @classmethod
@@ -195,6 +205,7 @@ class TimelineEvent:
             evidence=data.get("evidence", ""),
             intensity=data.get("intensity", 0.7),
             variation=data.get("variation", 0.0),
+            user_edited=data.get("user_edited", False),
         )
 
 
@@ -216,7 +227,7 @@ def candidates_to_timeline_events(
     *,
     selected_candidates: Iterable[ActivityCandidate] | None = None,
 ) -> list[TimelineEvent]:
-    """Convert ActivityCandidates into TimelineEvents, preserving selection state."""
+    """Convert ActivityCandidates into TimelineEvents, expanding burst timestamps."""
     selected_set = set(selected_candidates) if selected_candidates is not None else None
     result: list[TimelineEvent] = []
     for candidate in candidates:
@@ -225,6 +236,50 @@ def candidates_to_timeline_events(
             if selected_set is not None
             else (candidate.to_sound_event() is not None)
         )
-        result.append(TimelineEvent.from_candidate(candidate, enabled=enabled))
+        if (
+            candidate.candidate_type is not ActivityType.UNCERTAIN
+            and candidate.event_timestamps
+        ):
+            for ts in candidate.event_timestamps:
+                result.append(
+                    TimelineEvent.from_candidate(
+                        candidate,
+                        enabled=enabled,
+                        timestamp_seconds=ts,
+                    )
+                )
+        else:
+            result.append(TimelineEvent.from_candidate(candidate, enabled=enabled))
     result.sort(key=lambda item: (item.timestamp_seconds, item.event_id))
     return result
+
+
+def merge_detected_timeline_events(
+    existing_events: Iterable[TimelineEvent],
+    new_detected_events: Iterable[TimelineEvent],
+    *,
+    collision_tolerance_seconds: float = 0.05,
+) -> list[TimelineEvent]:
+    """Merge newly detected events without losing manual or user-edited events.
+
+    All ``EventSource.MANUAL`` events and any ``user_edited=True`` events are
+    preserved untouched. Unedited ``EventSource.DETECTED`` events are replaced
+    with ``new_detected_events``, skipping any new event that falls within
+    ``collision_tolerance_seconds`` of a preserved event.
+    """
+    preserved = [
+        event
+        for event in existing_events
+        if event.source is EventSource.MANUAL or event.user_edited
+    ]
+    merged = list(preserved)
+    for candidate in new_detected_events:
+        if any(
+            abs(candidate.timestamp_seconds - kept.timestamp_seconds)
+            <= collision_tolerance_seconds
+            for kept in preserved
+        ):
+            continue
+        merged.append(candidate)
+    merged.sort(key=lambda item: (item.timestamp_seconds, item.event_id))
+    return merged

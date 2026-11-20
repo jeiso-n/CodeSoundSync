@@ -7,6 +7,7 @@ import math
 import subprocess
 import threading
 from collections.abc import Callable, Iterable, Iterator
+from dataclasses import dataclass
 from pathlib import Path
 
 from codesound_sync.models.activity_candidate import (
@@ -36,6 +37,14 @@ class ActivityAnalysisCancelled(RuntimeError):
     """Raised when the user cancels activity analysis."""
 
 
+@dataclass(frozen=True)
+class _FrameChange:
+    timestamp_seconds: float
+    changed_fraction: float
+    changed_row_fraction: float
+    is_widespread: bool
+
+
 class FrameActivityAnalyzer:
     """Detect changes in downsampled grayscale frames, not definite input.
 
@@ -51,6 +60,8 @@ class FrameActivityAnalyzer:
         pixel_delta_threshold: int = 28,
         changed_pixel_fraction: float = 0.004,
         typing_cluster_gap_seconds: float = 1.0,
+        widespread_pixel_fraction: float = 0.25,
+        widespread_row_fraction: float = 0.40,
     ) -> None:
         if (
             isinstance(sample_interval_seconds, bool)
@@ -79,11 +90,27 @@ class FrameActivityAnalyzer:
             or typing_cluster_gap_seconds <= 0
         ):
             raise ValueError("Activity cluster gap must be greater than zero.")
+        if (
+            isinstance(widespread_pixel_fraction, bool)
+            or not isinstance(widespread_pixel_fraction, (int, float))
+            or not math.isfinite(widespread_pixel_fraction)
+            or not 0.0 < widespread_pixel_fraction <= 1.0
+        ):
+            raise ValueError("Widespread-pixel threshold must be between 0 and 1.")
+        if (
+            isinstance(widespread_row_fraction, bool)
+            or not isinstance(widespread_row_fraction, (int, float))
+            or not math.isfinite(widespread_row_fraction)
+            or not 0.0 < widespread_row_fraction <= 1.0
+        ):
+            raise ValueError("Widespread-row threshold must be between 0 and 1.")
 
         self.sample_interval_seconds = float(sample_interval_seconds)
         self.pixel_delta_threshold = pixel_delta_threshold
         self.changed_pixel_fraction = float(changed_pixel_fraction)
         self.typing_cluster_gap_seconds = float(typing_cluster_gap_seconds)
+        self.widespread_pixel_fraction = float(widespread_pixel_fraction)
+        self.widespread_row_fraction = float(widespread_row_fraction)
 
     def analyze_frames(
         self,
@@ -107,7 +134,7 @@ class FrameActivityAnalyzer:
             raise ValueError("Frame dimensions must be positive integers.")
         frame_size = frame_width * frame_height
         previous: bytes | None = None
-        changes: list[tuple[float, float]] = []
+        changes: list[_FrameChange] = []
         sampled_frames = 0
 
         for frame_index, frame in enumerate(frames):
@@ -120,13 +147,25 @@ class FrameActivityAnalyzer:
             timestamp = frame_index * self.sample_interval_seconds
             sampled_frames += 1
             if previous is not None:
-                changed_pixels = sum(
-                    abs(current - old) >= self.pixel_delta_threshold
-                    for old, current in zip(previous, frame)
+                changed_fraction, changed_row_fraction = self._measure_frame_change(
+                    previous,
+                    frame,
+                    frame_width=frame_width,
+                    frame_height=frame_height,
                 )
-                changed_fraction = changed_pixels / frame_size
                 if changed_fraction >= self.changed_pixel_fraction:
-                    changes.append((timestamp, changed_fraction))
+                    is_widespread = (
+                        changed_fraction >= self.widespread_pixel_fraction
+                        or changed_row_fraction >= self.widespread_row_fraction
+                    )
+                    changes.append(
+                        _FrameChange(
+                            timestamp_seconds=timestamp,
+                            changed_fraction=changed_fraction,
+                            changed_row_fraction=changed_row_fraction,
+                            is_widespread=is_widespread,
+                        )
+                    )
             previous = frame
 
             if (
@@ -268,14 +307,47 @@ class FrameActivityAnalyzer:
                 )
             yield frame
 
+    def _measure_frame_change(
+        self,
+        previous: bytes,
+        current: bytes,
+        *,
+        frame_width: int,
+        frame_height: int,
+    ) -> tuple[float, float]:
+        """Compute changed pixel fraction and fraction of rows with changed pixels."""
+        prev_view = memoryview(previous)
+        curr_view = memoryview(current)
+        threshold = self.pixel_delta_threshold
+        frame_size = frame_width * frame_height
+        changed_pixels = 0
+        changed_rows = 0
+
+        for row_start in range(0, frame_size, frame_width):
+            row_end = row_start + frame_width
+            row_changed = sum(
+                1
+                for old_pixel, new_pixel in zip(
+                    prev_view[row_start:row_end], curr_view[row_start:row_end]
+                )
+                if abs(new_pixel - old_pixel) >= threshold
+            )
+            if row_changed:
+                changed_pixels += row_changed
+                changed_rows += 1
+
+        return changed_pixels / frame_size, changed_rows / frame_height
+
     def _group_changes(
-        self, changes: list[tuple[float, float]]
+        self, changes: list[_FrameChange]
     ) -> list[ActivityCandidate]:
-        groups: list[list[tuple[float, float]]] = []
+        groups: list[list[_FrameChange]] = []
         for change in changes:
             if (
                 not groups
-                or change[0] - groups[-1][-1][0] > self.typing_cluster_gap_seconds
+                or groups[-1][-1].is_widespread != change.is_widespread
+                or change.timestamp_seconds - groups[-1][-1].timestamp_seconds
+                > self.typing_cluster_gap_seconds
             ):
                 groups.append([change])
             else:
@@ -284,20 +356,36 @@ class FrameActivityAnalyzer:
         candidates: list[ActivityCandidate] = []
         for group in groups:
             count = len(group)
-            timestamp = group[0][0]
-            if count >= 2:
+            timestamps = tuple(change.timestamp_seconds for change in group)
+            timestamp = timestamps[0]
+            if group[0].is_widespread:
+                peak_fraction = max(change.changed_fraction for change in group)
+                confidence = min(0.32, 0.18 + peak_fraction * 0.2)
+                candidate_type = ActivityType.UNCERTAIN
+                if count == 1:
+                    evidence = (
+                        "Widespread visual change across the frame; likely a scene "
+                        "cut, window switch, or scrolling rather than localized typing."
+                    )
+                else:
+                    evidence = (
+                        f"{count} widespread visual changes across the frame; likely "
+                        "scrolling, scene cuts, or full-screen animation rather than "
+                        "localized typing."
+                    )
+            elif count >= 2:
                 confidence = min(0.62, 0.40 + 0.035 * min(count - 2, 6))
                 candidate_type = ActivityType.TYPING
                 evidence = (
-                    f"{count} nearby frame changes; possible typing, scrolling, "
+                    f"{count} nearby localized frame changes; possible typing, "
                     "animation, or other visual activity. Not proof of keypresses."
                 )
             else:
-                confidence = min(0.38, 0.22 + group[0][1] * 0.8)
+                confidence = min(0.38, 0.22 + group[0].changed_fraction * 0.8)
                 candidate_type = ActivityType.UNCERTAIN
                 evidence = (
-                    "One isolated visual change; could be cursor blink, a scene "
-                    "change, animation, or interaction."
+                    "One isolated localized visual change; could be cursor blink, "
+                    "animation, or interaction."
                 )
             candidates.append(
                 ActivityCandidate(
@@ -306,6 +394,7 @@ class FrameActivityAnalyzer:
                     confidence=confidence,
                     evidence=evidence,
                     change_count=count,
+                    event_timestamps=timestamps,
                 )
             )
         return candidates

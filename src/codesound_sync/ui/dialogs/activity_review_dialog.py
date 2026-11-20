@@ -22,12 +22,13 @@ from codesound_sync.models.activity_candidate import (
 class ActivityReviewDialog(QDialog):
     """Checkbox table for reviewing and selecting visual-activity candidates."""
 
+    apply_requested = Signal(object)  # tuple[ActivityCandidate, ...]
     generate_requested = Signal(object)  # tuple[ActivityCandidate, ...]
 
     def __init__(self, result: ActivityAnalysisResult, parent=None) -> None:
         super().__init__(parent)
         self.setWindowTitle("Review Video Activity")
-        self.setMinimumSize(760, 420)
+        self.setMinimumSize(780, 440)
         self._candidates = result.candidates
 
         layout = QVBoxLayout(self)
@@ -39,8 +40,8 @@ class ActivityReviewDialog(QDialog):
         layout.addWidget(summary)
         note = QLabel(
             "Visual changes are estimates, not proof of keypresses or clicks. "
-            "The generated sound-effects track uses source-video timestamps; "
-            "it is not aligned to edited or speed-changed footage."
+            "Applying candidates merges them onto the timeline while preserving your "
+            "manual and edited events."
         )
         note.setWordWrap(True)
         layout.addWidget(note)
@@ -53,7 +54,7 @@ class ActivityReviewDialog(QDialog):
         self.table.setEditTriggers(QTableWidget.NoEditTriggers)
         self.table.horizontalHeader().setStretchLastSection(True)
         self.table.setColumnWidth(0, 70)
-        self.table.setColumnWidth(1, 100)
+        self.table.setColumnWidth(1, 130)
         self.table.setColumnWidth(2, 165)
         self.table.setColumnWidth(3, 90)
         for row, candidate in enumerate(result.candidates):
@@ -64,11 +65,13 @@ class ActivityReviewDialog(QDialog):
             )
             self.table.setItem(row, 0, include)
 
-            self.table.setItem(
-                row,
-                1,
-                QTableWidgetItem(f"{candidate.timestamp_seconds:.2f} s"),
-            )
+            ts_text = f"{candidate.timestamp_seconds:.2f} s"
+            if len(candidate.event_timestamps) > 1:
+                ts_text = (
+                    f"{candidate.timestamp_seconds:.2f} s "
+                    f"({len(candidate.event_timestamps)} taps)"
+                )
+            self.table.setItem(row, 1, QTableWidgetItem(ts_text))
             self.table.setItem(
                 row, 2, QTableWidgetItem(candidate.candidate_type.value)
             )
@@ -79,8 +82,12 @@ class ActivityReviewDialog(QDialog):
         layout.addWidget(self.table, 1)
 
         buttons = QHBoxLayout()
+        self.apply_button = QPushButton("Apply Selected to Timeline")
+        self.apply_button.setObjectName("primaryButton")
+        self.apply_button.clicked.connect(self._apply_selected)
+        buttons.addWidget(self.apply_button)
+
         self.generate_button = QPushButton("Generate Sound Effects Track")
-        self.generate_button.setObjectName("primaryButton")
         self.generate_button.clicked.connect(self._generate_selected)
         buttons.addWidget(self.generate_button)
         buttons.addStretch()
@@ -96,6 +103,10 @@ class ActivityReviewDialog(QDialog):
             for row, candidate in enumerate(self._candidates)
             if self.table.item(row, 0).checkState() == Qt.Checked
         )
+
+    def _apply_selected(self) -> None:
+        self.apply_requested.emit(self.selected_candidates())
+        self.close()
 
     def _generate_selected(self) -> None:
         self.generate_requested.emit(self.selected_candidates())

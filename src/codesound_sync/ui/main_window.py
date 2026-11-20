@@ -9,6 +9,7 @@ from uuid import uuid4
 
 from PySide6.QtCore import Qt
 from PySide6.QtWidgets import (
+    QComboBox,
     QFileDialog,
     QFormLayout,
     QGroupBox,
@@ -43,6 +44,7 @@ from codesound_sync.models.timeline_event import (
     EventSource,
     TimelineEvent,
     candidates_to_timeline_events,
+    merge_detected_timeline_events,
     timeline_events_to_sound_events,
 )
 from codesound_sync.services.project_service import ProjectFileError, ProjectService
@@ -142,6 +144,9 @@ class MainWindow(QMainWindow):
         self.workspace_panel.timeline_widget.event_moved.connect(
             self._on_timeline_event_moved
         )
+        self.workspace_panel.timeline_widget.delete_requested.connect(
+            self._delete_timeline_event
+        )
         self.workspace_panel.event_inspector.add_event_requested.connect(
             self._add_timeline_event_at_playhead
         )
@@ -153,6 +158,12 @@ class MainWindow(QMainWindow):
         )
         self.workspace_panel.event_inspector.preview_sound_requested.connect(
             self._on_preview_sound_requested
+        )
+        self.workspace_panel.event_inspector.preview_mix_requested.connect(
+            self._preview_timeline_mix
+        )
+        self.workspace_panel.event_inspector.stop_preview_requested.connect(
+            self._stop_sound_preview
         )
         self.workspace_panel.event_inspector.export_timeline_requested.connect(
             self._export_timeline_sounds
@@ -225,6 +236,16 @@ class MainWindow(QMainWindow):
         )
         self.analyze_activity_button.clicked.connect(self._analyze_video_activity)
         form.addRow(self.analyze_activity_button)
+
+        self.sample_interval_combo = QComboBox()
+        self.sample_interval_combo.addItem("0.25 s (fine / sped-up)", 0.25)
+        self.sample_interval_combo.addItem("0.50 s (balanced)", 0.50)
+        self.sample_interval_combo.addItem("1.00 s (fast)", 1.00)
+        self.sample_interval_combo.setCurrentIndex(1)
+        self.sample_interval_combo.setToolTip(
+            "Frame sampling interval for visual activity detection."
+        )
+        form.addRow("Detection interval", self.sample_interval_combo)
         return group
 
     def _apply_theme(self) -> None:
@@ -538,8 +559,11 @@ class MainWindow(QMainWindow):
             self._review_dialog.deleteLater()
             self._review_dialog = None
 
+        sample_interval = self.sample_interval_combo.currentData()
+        if not isinstance(sample_interval, (int, float)):
+            sample_interval = ACTIVITY_SAMPLE_INTERVAL_SECONDS
         analyzer = FrameActivityAnalyzer(
-            sample_interval_seconds=ACTIVITY_SAMPLE_INTERVAL_SECONDS
+            sample_interval_seconds=float(sample_interval)
         )
         worker = ActivityAnalysisWorker(self._project.source_video, analyzer, self)
         self._activity_worker = worker
@@ -584,8 +608,10 @@ class MainWindow(QMainWindow):
         self.statusBar().showMessage(summary)
         self._activity_result = result
         if self._project is not None:
-            self._project.timeline_events = candidates_to_timeline_events(
-                result.candidates
+            detected_events = candidates_to_timeline_events(result.candidates)
+            self._project.timeline_events = merge_detected_timeline_events(
+                self._project.timeline_events,
+                detected_events,
             )
             self._project.touch()
             if (
@@ -597,6 +623,7 @@ class MainWindow(QMainWindow):
                 )
             self.workspace_panel.set_timeline_events(self._project.timeline_events)
         dialog = ActivityReviewDialog(result, self)
+        dialog.apply_requested.connect(self._apply_activity_candidates)
         dialog.generate_requested.connect(self._generate_activity_sounds)
         self._review_dialog = dialog
         dialog.show()
@@ -624,13 +651,38 @@ class MainWindow(QMainWindow):
         if worker is not None:
             self._on_activity_finished(worker)
 
+    def _apply_activity_candidates(
+        self, candidates: tuple[ActivityCandidate, ...]
+    ) -> None:
+        if self._project is None or self._activity_result is None:
+            return
+        detected_events = candidates_to_timeline_events(
+            self._activity_result.candidates,
+            selected_candidates=candidates,
+        )
+        self._project.timeline_events = merge_detected_timeline_events(
+            self._project.timeline_events,
+            detected_events,
+        )
+        self._project.touch()
+        self.workspace_panel.set_timeline_events(self._project.timeline_events)
+        self.status_panel.success(
+            f"Applied {len(candidates)} reviewed candidate group(s) to timeline "
+            "(manual and edited events preserved)."
+        )
+        self.statusBar().showMessage("Reviewed candidates applied to timeline")
+
     def _generate_activity_sounds(
         self, candidates: tuple[ActivityCandidate, ...]
     ) -> None:
         if self._project is not None and self._activity_result is not None:
-            self._project.timeline_events = candidates_to_timeline_events(
+            detected_events = candidates_to_timeline_events(
                 self._activity_result.candidates,
                 selected_candidates=candidates,
+            )
+            self._project.timeline_events = merge_detected_timeline_events(
+                self._project.timeline_events,
+                detected_events,
             )
             self._project.touch()
             self.workspace_panel.set_timeline_events(self._project.timeline_events)
@@ -712,7 +764,9 @@ class MainWindow(QMainWindow):
         updated_list: list[TimelineEvent] = []
         for item in self._project.timeline_events:
             if item.event_id == event_id:
-                updated_list.append(replace(item, timestamp_seconds=clamped_ts))
+                updated_list.append(
+                    replace(item, timestamp_seconds=clamped_ts, user_edited=True)
+                )
             else:
                 updated_list.append(item)
         updated_list.sort(key=lambda item: (item.timestamp_seconds, item.event_id))
@@ -725,17 +779,18 @@ class MainWindow(QMainWindow):
     def _on_inspector_event_modified(self, updated_event: TimelineEvent) -> None:
         if self._project is None:
             return
+        edited_event = replace(updated_event, user_edited=True)
         updated_list: list[TimelineEvent] = []
         for item in self._project.timeline_events:
-            if item.event_id == updated_event.event_id:
-                updated_list.append(updated_event)
+            if item.event_id == edited_event.event_id:
+                updated_list.append(edited_event)
             else:
                 updated_list.append(item)
         updated_list.sort(key=lambda item: (item.timestamp_seconds, item.event_id))
         self._project.timeline_events = updated_list
         self._project.touch()
         self.workspace_panel.set_timeline_events(
-            self._project.timeline_events, selected_event_id=updated_event.event_id
+            self._project.timeline_events, selected_event_id=edited_event.event_id
         )
 
     def _on_preview_sound_requested(
@@ -758,6 +813,42 @@ class MainWindow(QMainWindow):
         )
         self.status_panel.info(msg)
         self.statusBar().showMessage(msg)
+
+    def _preview_timeline_mix(self) -> None:
+        if self._project is None or not self._project.timeline_events:
+            self.status_panel.warning(
+                "No timeline events to preview. Add or analyze events first."
+            )
+            self.statusBar().showMessage("No timeline events to preview")
+            return
+
+        duration_seconds: float | None = None
+        if (
+            self._project.media_info is not None
+            and self._project.media_info.duration_seconds is not None
+        ):
+            duration_seconds = self._project.media_info.duration_seconds
+        elif self.workspace_panel.timeline_widget.effective_duration > 0.0:
+            duration_seconds = self.workspace_panel.timeline_widget.effective_duration
+
+        try:
+            self._sound_preview_service.preview_timeline_mix(
+                self._project.timeline_events,
+                duration_seconds=duration_seconds,
+            )
+        except (SoundPreviewError, ValueError) as exc:
+            self.status_panel.warning(f"Could not preview timeline mix: {exc}")
+            self.statusBar().showMessage("Timeline mix preview unavailable")
+            return
+
+        count = len(timeline_events_to_sound_events(self._project.timeline_events))
+        msg = f"Previewing synchronized timeline mix ({count} sound event(s))."
+        self.status_panel.info(msg)
+        self.statusBar().showMessage(msg)
+
+    def _stop_sound_preview(self) -> None:
+        self._sound_preview_service.stop()
+        self.statusBar().showMessage("Audio preview stopped")
 
     def _export_timeline_sounds(self) -> None:
         if self._project is None or not self._project.timeline_events:
@@ -816,15 +907,10 @@ class MainWindow(QMainWindow):
         self.statusBar().showMessage("Sound-effects-only track generated")
 
     def _analyze_video(self) -> None:
-        if self._project is None or self._project.media_info is None:
-            return
-        self.status_panel.info(
-            "Stage 1 analysis complete: video metadata is available. "
-            "Frame-level activity analysis will be added in a later stage."
-        )
-        self.statusBar().showMessage("Stage 1 media inspection complete")
+        self._analyze_video_activity()
 
     def closeEvent(self, event) -> None:  # noqa: N802
+        self._sound_preview_service.stop()
         self.workspace_panel.shutdown()
         activity_worker = self._activity_worker
         if activity_worker is not None and activity_worker.isRunning():

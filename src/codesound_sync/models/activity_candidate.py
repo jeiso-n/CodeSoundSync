@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import math
+from collections.abc import Iterable
 from dataclasses import dataclass
 from enum import Enum
 
@@ -27,6 +28,7 @@ class ActivityCandidate:
     confidence: float
     evidence: str
     change_count: int = 1
+    event_timestamps: tuple[float, ...] = ()
 
     def __post_init__(self) -> None:
         if (
@@ -61,20 +63,54 @@ class ActivityCandidate:
         ):
             raise ValueError("Candidate change count must be a positive integer.")
 
-    def to_sound_event(self) -> SoundEvent | None:
-        """Convert supported reviewed candidates; uncertain activity is ignored."""
+        if isinstance(self.event_timestamps, (str, bytes)) or not isinstance(
+            self.event_timestamps, Iterable
+        ):
+            raise ValueError(
+                "Candidate event timestamps must be an iterable of finite, non-negative numbers."
+            )
+        parsed_timestamps: list[float] = []
+        for timestamp in self.event_timestamps:
+            if (
+                isinstance(timestamp, bool)
+                or not isinstance(timestamp, (int, float))
+                or not math.isfinite(timestamp)
+                or timestamp < 0
+            ):
+                raise ValueError(
+                    "Candidate event timestamps must be finite and non-negative."
+                )
+            parsed_timestamps.append(float(timestamp))
+        normalized_timestamps = (
+            tuple(sorted(parsed_timestamps))
+            if parsed_timestamps
+            else (float(self.timestamp_seconds),)
+        )
+        object.__setattr__(self, "event_timestamps", normalized_timestamps)
+
+    def to_sound_events(self) -> tuple[SoundEvent, ...]:
+        """Convert supported reviewed candidates into one SoundEvent per timestamp."""
         event_type = {
             ActivityType.TYPING: SoundEventType.KEYBOARD_TAP,
             ActivityType.LEFT_CLICK: SoundEventType.MOUSE_LEFT_CLICK,
             ActivityType.RIGHT_CLICK: SoundEventType.MOUSE_RIGHT_CLICK,
         }.get(self.candidate_type)
         if event_type is None:
-            return None
-        return SoundEvent(
-            timestamp_seconds=self.timestamp_seconds,
-            event_type=event_type,
-            intensity=min(0.7, max(0.25, float(self.confidence))),
+            return ()
+        intensity = min(0.7, max(0.25, float(self.confidence)))
+        return tuple(
+            SoundEvent(
+                timestamp_seconds=timestamp,
+                event_type=event_type,
+                intensity=intensity,
+            )
+            for timestamp in self.event_timestamps
         )
+
+    def to_sound_event(self) -> SoundEvent | None:
+        """Backwards-compatible single-event conversion returning the first event."""
+        events = self.to_sound_events()
+        return events[0] if events else None
 
 
 @dataclass(frozen=True)
@@ -120,9 +156,8 @@ def candidates_to_sound_events(
     Uncertain activity remains reviewable but is deliberately not converted into
     invented key or mouse sounds.
     """
-    events = []
+    events: list[SoundEvent] = []
     for candidate in candidates:
-        event = candidate.to_sound_event()
-        if event is not None:
-            events.append(event)
+        events.extend(candidate.to_sound_events())
+    events.sort(key=lambda event: event.timestamp_seconds)
     return tuple(events)

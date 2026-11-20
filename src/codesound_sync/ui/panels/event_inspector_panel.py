@@ -30,6 +30,8 @@ class EventInspectorPanel(QWidget):
     delete_event_requested = Signal(str)  # event_id
     event_modified = Signal(object)  # TimelineEvent
     preview_sound_requested = Signal(object, object)  # TimelineEvent, float | None
+    preview_mix_requested = Signal()
+    stop_preview_requested = Signal()
     export_timeline_requested = Signal()
 
     def __init__(self, parent=None) -> None:
@@ -75,6 +77,18 @@ class EventInspectorPanel(QWidget):
         top_row.addWidget(self.audition_variation_button)
 
         top_row.addStretch()
+
+        self.preview_mix_button = QPushButton("Preview Mix")
+        self.preview_mix_button.setToolTip(
+            "Audition the full synchronized timeline sound-effects mix."
+        )
+        self.preview_mix_button.clicked.connect(self.preview_mix_requested.emit)
+        top_row.addWidget(self.preview_mix_button)
+
+        self.stop_preview_button = QPushButton("Stop Audio")
+        self.stop_preview_button.setToolTip("Stop any currently playing audio preview.")
+        self.stop_preview_button.clicked.connect(self.stop_preview_requested.emit)
+        top_row.addWidget(self.stop_preview_button)
 
         self.export_timeline_button = QPushButton("Export Timeline WAV")
         self.export_timeline_button.setObjectName("primaryButton")

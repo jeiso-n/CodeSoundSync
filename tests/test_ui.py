@@ -73,10 +73,10 @@ def test_window_import_runs_probe_in_background(
     assert window.analyze_button.isEnabled()
     assert window.save_project_button.isEnabled()
 
-    window._analyze_video()
-    assert "Stage 1 analysis complete" in window.status_panel.findChild(
-        QPlainTextEdit
-    ).toPlainText()
+    launched: list[bool] = []
+    monkeypatch.setattr(window, "_analyze_video_activity", lambda: launched.append(True))
+    window.analyze_button.click()
+    assert launched == [True]
 
 
 def test_window_shows_missing_ffprobe_error(

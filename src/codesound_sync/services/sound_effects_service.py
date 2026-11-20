@@ -58,27 +58,6 @@ class SoundEffectsService:
         for identical repeats, or a seed for reproducible generated variation.
         Existing files are never overwritten.
         """
-        if duration_seconds is not None and (
-            isinstance(duration_seconds, bool)
-            or not isinstance(duration_seconds, (int, float))
-            or not math.isfinite(duration_seconds)
-            or duration_seconds < 0
-        ):
-            raise ValueError("Duration must be a finite, non-negative number.")
-        if not isinstance(variation, bool):
-            raise ValueError("Variation must be True or False.")
-        if random_seed is not None and (
-            isinstance(random_seed, bool) or not isinstance(random_seed, int)
-        ):
-            raise ValueError("Random seed must be an integer or None.")
-
-        try:
-            scheduled_events = tuple(events)
-        except TypeError as exc:
-            raise ValueError("Events must be an iterable of SoundEvent objects.") from exc
-        if any(not isinstance(event, SoundEvent) for event in scheduled_events):
-            raise ValueError("Events must contain only SoundEvent objects.")
-
         try:
             target = Path(output_path)
         except (TypeError, ValueError) as exc:
@@ -86,48 +65,12 @@ class SoundEffectsService:
         if target.suffix.lower() != ".wav":
             raise ValueError("Output file must use the .wav extension.")
 
-        rng = random.Random(random_seed)
-        rendered_events: list[tuple[int, list[float]]] = []
-        frame_count = 0
-        if duration_seconds is not None:
-            requested_frames = duration_seconds * self.sample_rate
-            if not math.isfinite(requested_frames):
-                raise ValueError("Requested duration is too large to render.")
-            frame_count = math.ceil(requested_frames)
-            if frame_count > _MAX_WAV_FRAMES:
-                raise ValueError("Requested duration exceeds the WAV format limit.")
-
-        for event in scheduled_events:
-            event_variation = float(event.variation)
-            if variation and event.event_type is SoundEventType.KEYBOARD_TAP:
-                event_variation = max(
-                    -1.0,
-                    min(1.0, event_variation + rng.uniform(-0.12, 0.12)),
-                )
-            samples = self._generator.generate(
-                event.event_type,
-                intensity=event.intensity,
-                variation=event_variation,
-            )
-            position_frames = event.timestamp_seconds * self.sample_rate
-            if not math.isfinite(position_frames):
-                raise ValueError("Event timestamp is too large to render.")
-            start_frame = round(position_frames)
-            rendered_events.append((start_frame, samples))
-            frame_count = max(frame_count, start_frame + len(samples))
-            if frame_count > _MAX_WAV_FRAMES:
-                raise ValueError("Event duration exceeds the WAV format limit.")
-
-        rendered_events.sort(key=lambda item: item[0])
-        peak = max(
-            (
-                abs(sample)
-                for chunk in self._iter_mixed_chunks(rendered_events, frame_count)
-                for sample in chunk
-            ),
-            default=0.0,
+        rendered_events, frame_count, gain = self._prepare_mix(
+            events,
+            duration_seconds=duration_seconds,
+            variation=variation,
+            random_seed=random_seed,
         )
-        gain = 0.95 / peak if peak > 0.95 else 1.0
 
         created = False
         try:
@@ -135,25 +78,7 @@ class SoundEffectsService:
             with target.open("xb") as output_file:
                 created = True
                 with wave.open(output_file, "wb") as wav_file:
-                    wav_file.setnchannels(1)
-                    wav_file.setsampwidth(2)
-                    wav_file.setframerate(self.sample_rate)
-                    for chunk in self._iter_mixed_chunks(
-                        rendered_events, frame_count
-                    ):
-                        pcm = array.array(
-                            "h",
-                            (
-                                max(
-                                    -32768,
-                                    min(32767, round(sample * gain * 32767)),
-                                )
-                                for sample in chunk
-                            ),
-                        )
-                        if sys.byteorder != "little":
-                            pcm.byteswap()
-                        wav_file.writeframesraw(pcm.tobytes())
+                    self._write_wav_stream(wav_file, rendered_events, frame_count, gain)
         except (OSError, wave.Error) as exc:
             if created:
                 with suppress(OSError):
@@ -191,34 +116,132 @@ class SoundEffectsService:
                     mixed[frame - block_start] += samples[frame - start]
             yield mixed
 
+    def render_wav_bytes(
+        self,
+        events: Iterable[SoundEvent],
+        duration_seconds: float | None = None,
+        *,
+        variation: bool = True,
+        random_seed: int | None = None,
+    ) -> bytes:
+        """Render *events* into an in-memory 16-bit mono PCM WAV buffer."""
+        rendered_events, frame_count, gain = self._prepare_mix(
+            events,
+            duration_seconds=duration_seconds,
+            variation=variation,
+            random_seed=random_seed,
+        )
+        buffer = io.BytesIO()
+        with wave.open(buffer, "wb") as wav_file:
+            self._write_wav_stream(wav_file, rendered_events, frame_count, gain)
+        return buffer.getvalue()
+
+    def _prepare_mix(
+        self,
+        events: Iterable[SoundEvent],
+        *,
+        duration_seconds: float | None,
+        variation: bool,
+        random_seed: int | None,
+    ) -> tuple[list[tuple[int, list[float]]], int, float]:
+        if duration_seconds is not None and (
+            isinstance(duration_seconds, bool)
+            or not isinstance(duration_seconds, (int, float))
+            or not math.isfinite(duration_seconds)
+            or duration_seconds < 0
+        ):
+            raise ValueError("Duration must be a finite, non-negative number.")
+        if not isinstance(variation, bool):
+            raise ValueError("Variation must be True or False.")
+        if random_seed is not None and (
+            isinstance(random_seed, bool) or not isinstance(random_seed, int)
+        ):
+            raise ValueError("Random seed must be an integer or None.")
+
+        try:
+            scheduled_events = tuple(events)
+        except TypeError as exc:
+            raise ValueError("Events must be an iterable of SoundEvent objects.") from exc
+        if any(not isinstance(event, SoundEvent) for event in scheduled_events):
+            raise ValueError("Events must contain only SoundEvent objects.")
+
+        rng = random.Random(random_seed)
+        rendered_events: list[tuple[int, list[float]]] = []
+        frame_count = 0
+        if duration_seconds is not None:
+            requested_frames = duration_seconds * self.sample_rate
+            if not math.isfinite(requested_frames):
+                raise ValueError("Requested duration is too large to render.")
+            frame_count = math.ceil(requested_frames)
+            if frame_count > _MAX_WAV_FRAMES:
+                raise ValueError("Requested duration exceeds the WAV format limit.")
+
+        for event in scheduled_events:
+            event_variation = float(event.variation)
+            if variation and event.event_type is SoundEventType.KEYBOARD_TAP:
+                event_variation = max(
+                    -1.0,
+                    min(1.0, event_variation + rng.uniform(-0.14, 0.14)),
+                )
+            samples = self._generator.generate(
+                event.event_type,
+                intensity=event.intensity,
+                variation=event_variation,
+            )
+            position_frames = event.timestamp_seconds * self.sample_rate
+            if not math.isfinite(position_frames):
+                raise ValueError("Event timestamp is too large to render.")
+            start_frame = round(position_frames)
+            rendered_events.append((start_frame, samples))
+            frame_count = max(frame_count, start_frame + len(samples))
+            if frame_count > _MAX_WAV_FRAMES:
+                raise ValueError("Event duration exceeds the WAV format limit.")
+
+        rendered_events.sort(key=lambda item: item[0])
+        peak = max(
+            (
+                abs(sample)
+                for chunk in self._iter_mixed_chunks(rendered_events, frame_count)
+                for sample in chunk
+            ),
+            default=0.0,
+        )
+        gain = 0.95 / peak if peak > 0.95 else 1.0
+        return rendered_events, frame_count, gain
+
+    def _write_wav_stream(
+        self,
+        wav_file: wave.Wave_write,
+        rendered_events: list[tuple[int, list[float]]],
+        frame_count: int,
+        gain: float,
+    ) -> None:
+        wav_file.setnchannels(1)
+        wav_file.setsampwidth(2)
+        wav_file.setframerate(self.sample_rate)
+        for chunk in self._iter_mixed_chunks(rendered_events, frame_count):
+            pcm = array.array(
+                "h",
+                (
+                    max(
+                        -32768,
+                        min(32767, round(sample * gain * 32767)),
+                    )
+                    for sample in chunk
+                ),
+            )
+            if sys.byteorder != "little":
+                pcm.byteswap()
+            wav_file.writeframesraw(pcm.tobytes())
+
     def render_event_wav_bytes(self, event: SoundEvent) -> bytes:
         """Synthesize a single *event* into an in-memory 16-bit mono PCM WAV buffer."""
         if not isinstance(event, SoundEvent):
             raise ValueError("Expected a SoundEvent instance.")
-        samples = self._generator.generate(
-            event.event_type,
-            intensity=event.intensity,
-            variation=event.variation,
+        return self.render_wav_bytes(
+            (SoundEvent(0.0, event.event_type, event.intensity, event.variation),),
+            variation=False,
         )
-        peak = max((abs(sample) for sample in samples), default=0.0)
-        gain = 0.95 / peak if peak > 0.95 else 1.0
-        pcm = array.array(
-            "h",
-            (
-                max(-32768, min(32767, round(sample * gain * 32767)))
-                for sample in samples
-            ),
-        )
-        if sys.byteorder != "little":
-            pcm.byteswap()
-
-        buffer = io.BytesIO()
-        with wave.open(buffer, "wb") as wav_file:
-            wav_file.setnchannels(1)
-            wav_file.setsampwidth(2)
-            wav_file.setframerate(self.sample_rate)
-            wav_file.writeframesraw(pcm.tobytes())
-        return buffer.getvalue()
 
     @staticmethod
     def demo_events() -> tuple[SoundEvent, ...]:

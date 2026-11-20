@@ -349,3 +349,88 @@ def test_event_inspector_add_reclassify_delete_persist_preview_and_export(
     reopened_window.workspace_panel.timeline_widget.select_event(added.event_id)
     reopened_window.workspace_panel.event_inspector.delete_event_button.click()
     assert len(reopened_window.workspace_panel.timeline_widget.events) == 1
+
+
+def test_reanalysis_preserves_manual_and_edited_events_and_supports_mix_preview(
+    qtbot, tmp_path: Path
+) -> None:
+    played: list[bytes] = []
+    stopped: list[bool] = []
+    window = MainWindow()
+    window._sound_preview_service = SoundPreviewService(
+        window._sound_effects_service,
+        player=played.append,
+        stopper=lambda: stopped.append(True),
+    )
+    window.workspace_panel._preview_service = FakePreviewService()
+    qtbot.addWidget(window)
+    window.show()
+
+    window._project = Project(name="Preserve Edits")
+    window.workspace_panel.set_duration(10.0, load_initial_frame=False)
+
+    # User adds a manual event at 2.0s
+    window.workspace_panel.seek_to(2.0, user_initiated=False)
+    window.workspace_panel.event_inspector.add_event_button.click()
+    manual_id = window.workspace_panel.timeline_widget.selected_event_id
+    assert manual_id is not None
+
+    # Run activity analysis with a typing burst at 4.0s, 4.5s
+    result = ActivityAnalysisResult(
+        candidates=(
+            ActivityCandidate(
+                4.0,
+                ActivityType.TYPING,
+                0.55,
+                "2 nearby localized frame changes.",
+                change_count=2,
+                event_timestamps=(4.0, 4.5),
+            ),
+        ),
+        sample_interval_seconds=0.5,
+        sampled_frame_count=20,
+        video_duration_seconds=10.0,
+    )
+    window._on_activity_ready(result)
+    assert window._review_dialog is not None
+    window._review_dialog.apply_button.click()
+
+    events = window.workspace_panel.timeline_widget.events
+    assert [e.timestamp_seconds for e in events] == [2.0, 4.0, 4.5]
+    assert events[0].event_id == manual_id
+
+    # Edit the detected event at 4.0s -> becomes user_edited=True
+    window.workspace_panel.timeline_widget.select_event(events[1].event_id)
+    window.workspace_panel.event_inspector.set_classification(
+        EventClassification.MOUSE_LEFT_CLICK
+    )
+
+    # Re-run analysis with a new detection at 7.0s -> manual (2.0s) and edited (4.0s) survive!
+    result_2 = ActivityAnalysisResult(
+        candidates=(
+            ActivityCandidate(
+                7.0,
+                ActivityType.TYPING,
+                0.52,
+                "2 nearby localized frame changes.",
+                change_count=2,
+                event_timestamps=(7.0, 7.5),
+            ),
+        ),
+        sample_interval_seconds=0.5,
+        sampled_frame_count=20,
+        video_duration_seconds=10.0,
+    )
+    window._on_activity_ready(result_2)
+    if window._review_dialog is not None:
+        window._review_dialog.close()
+
+    after_reanalysis = window.workspace_panel.timeline_widget.events
+    assert [e.timestamp_seconds for e in after_reanalysis] == [2.0, 4.0, 7.0, 7.5]
+    assert after_reanalysis[1].classification is EventClassification.MOUSE_LEFT_CLICK
+
+    # Preview full timeline mix and stop audio
+    window.workspace_panel.event_inspector.preview_mix_button.click()
+    assert len(played) == 1
+    window.workspace_panel.event_inspector.stop_preview_button.click()
+    assert stopped == [True]

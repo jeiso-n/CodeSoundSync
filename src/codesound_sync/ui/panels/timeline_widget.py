@@ -6,7 +6,7 @@ import math
 from collections.abc import Iterable
 
 from PySide6.QtCore import QPointF, QRectF, Qt, Signal
-from PySide6.QtGui import QColor, QFont, QMouseEvent, QPainter, QPainterPath, QPen
+from PySide6.QtGui import QColor, QFont, QKeyEvent, QMouseEvent, QPainter, QPainterPath, QPen
 from PySide6.QtWidgets import QSizePolicy, QWidget
 
 from codesound_sync.models.timeline_event import EventClassification, TimelineEvent
@@ -31,6 +31,7 @@ class TimelineWidget(QWidget):
     seek_requested = Signal(float)
     event_selected = Signal(object)  # TimelineEvent | None
     event_moved = Signal(str, float)  # event_id, timestamp_seconds
+    delete_requested = Signal(str)  # event_id
 
     def __init__(self, parent=None) -> None:
         super().__init__(parent)
@@ -254,6 +255,16 @@ class TimelineWidget(QWidget):
             self._dragging_event_id = None
             self._scrubbing_playhead = False
         super().mouseReleaseEvent(event)
+
+    def keyPressEvent(self, event: QKeyEvent) -> None:  # noqa: N802
+        if (
+            event.key() in (Qt.Key_Delete, Qt.Key_Backspace)
+            and self._selected_event_id is not None
+        ):
+            self.delete_requested.emit(self._selected_event_id)
+            event.accept()
+            return
+        super().keyPressEvent(event)
 
     # ------------------------------------------------------------------
     # Painting
