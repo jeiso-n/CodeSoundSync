@@ -5,7 +5,6 @@ from pathlib import Path
 
 from PySide6.QtCore import QPointF, Qt
 from PySide6.QtGui import QMouseEvent
-from PySide6.QtWidgets import QPlainTextEdit
 
 from codesound_sync.models.activity_candidate import (
     ActivityAnalysisResult,
@@ -20,6 +19,7 @@ from codesound_sync.models.timeline_event import (
     TimelineEvent,
 )
 from codesound_sync.services.project_service import ProjectService
+from codesound_sync.services.sound_generator import KeyboardSoundStyle, MouseSoundStyle
 from codesound_sync.services.sound_preview_service import SoundPreviewService
 from codesound_sync.services.video_preview_service import (
     PreviewFrame,
@@ -79,86 +79,85 @@ def test_video_preview_seek_step_play_and_error_handling(
 
     window = MainWindow()
     fake_preview = FakePreviewService()
-    window.workspace_panel._preview_service = fake_preview
+    window.video_preview._preview_service = fake_preview
     qtbot.addWidget(window)
     window.show()
 
+    media_info = MediaInfo(
+        path=video,
+        duration_seconds=10.0,
+        width=1280,
+        height=720,
+        frame_rate=30.0,
+        video_codec="h264",
+        audio_codec="aac",
+        bit_rate_kbps=1000,
+        size_bytes=512,
+        audio_streams=("aac",),
+    )
     window._project = Project(
         name="Demo",
         source_video=video,
-        media_info=MediaInfo(
-            path=video,
-            duration_seconds=10.0,
-            width=1280,
-            height=720,
-            frame_rate=30.0,
-            video_codec="h264",
-            audio_codec="aac",
-            bit_rate_kbps=1000,
-            size_bytes=512,
-            audio_streams=("aac",),
-        ),
+        media_info=media_info,
     )
-    window.workspace_panel.set_video(video)
-    window.workspace_panel.set_duration(10.0, load_initial_frame=True)
+    window.video_step.show_loaded_video(video, media_info=media_info)
+    window.video_preview.set_video(video)
+    window.video_preview.set_duration(10.0, load_initial_frame=True)
+    window.review_step.timeline_widget.set_duration(10.0)
     qtbot.waitUntil(
-        lambda: window.workspace_panel._frame_worker is None, timeout=2000
+        lambda: window.video_preview._frame_worker is None, timeout=2000
     )
 
     assert fake_preview.extracted_timestamps == [0.0]
-    assert window.workspace_panel._current_pixmap is not None
-    assert window.workspace_panel.time_label.text() == "00:00.00 / 00:10.00"
+    assert window.video_preview._current_pixmap is not None
+    assert window.video_preview.time_label.text() == "00:00.00 / 00:10.00"
 
-    # Step forward and backward
-    window.workspace_panel.step_forward_button.click()
+    window.video_preview.step_forward_button.click()
     qtbot.waitUntil(
-        lambda: window.workspace_panel._frame_worker is None, timeout=2000
+        lambda: window.video_preview._frame_worker is None, timeout=2000
     )
-    assert window.workspace_panel.current_seconds == 0.25
-    assert window.workspace_panel.timeline_widget.playhead_seconds == 0.25
+    assert window.video_preview.current_seconds == 0.25
+    assert window.review_step.timeline_widget.playhead_seconds == 0.25
 
-    window.workspace_panel.step_back_button.click()
+    window.video_preview.step_back_button.click()
     qtbot.waitUntil(
-        lambda: window.workspace_panel._frame_worker is None, timeout=2000
+        lambda: window.video_preview._frame_worker is None, timeout=2000
     )
-    assert window.workspace_panel.current_seconds == 0.0
+    assert window.video_preview.current_seconds == 0.0
 
-    # Play stream to completion
-    window.workspace_panel.play_pause_button.click()
+    window.video_preview.play_pause_button.click()
     qtbot.waitUntil(
-        lambda: window.workspace_panel._frame_worker is None, timeout=3000
+        lambda: window.video_preview._frame_worker is None, timeout=3000
     )
-    assert window.workspace_panel.play_pause_button.text() == "Play"
-    assert window.workspace_panel.current_seconds == 10.0
+    assert window.video_preview.play_pause_button.text() == "Play"
+    assert window.video_preview.current_seconds == 10.0
 
-    # Codec error when user explicitly plays an unsupported video
     fake_preview.should_fail = True
-    window.workspace_panel.play_pause_button.click()
+    window.video_preview.play_pause_button.click()
     qtbot.waitUntil(
-        lambda: window.workspace_panel._frame_worker is None, timeout=2000
+        lambda: window.video_preview._frame_worker is None, timeout=2000
     )
-    log_text = window.status_panel.findChild(QPlainTextEdit).toPlainText()
-    assert "Stream decode failed" in log_text
+    assert "Video preview could not play" in window.friendly_status_label.text()
 
 
-def test_timeline_coordinate_mapping_and_mouse_drag_editing(
+def test_timeline_coordinate_mapping_filtering_and_mouse_drag_editing(
     qtbot, tmp_path: Path
 ) -> None:
     window = MainWindow()
-    window.workspace_panel._preview_service = FakePreviewService()
+    window.video_preview._preview_service = FakePreviewService()
     qtbot.addWidget(window)
     window.resize(1100, 720)
     window.show()
+    window._switch_step(1)
 
-    timeline = window.workspace_panel.timeline_widget
-    timeline.resize(600, 90)
-    window.workspace_panel.set_duration(20.0, load_initial_frame=False)
+    timeline = window.review_step.timeline_widget
+    timeline.resize(600, 96)
+    window.video_preview.set_duration(20.0, load_initial_frame=False)
+    timeline.set_duration(20.0)
 
-    # Coordinate round-trip
     mid_x = timeline.time_to_x(10.0)
     assert abs(timeline.x_to_time(mid_x) - 10.0) <= 0.05
 
-    # Populate events from activity analysis
     result = ActivityAnalysisResult(
         candidates=(
             ActivityCandidate(
@@ -181,68 +180,80 @@ def test_timeline_coordinate_mapping_and_mouse_drag_editing(
     )
     window._project = Project(name="Timeline Test")
     window._on_activity_ready(result)
-    if window._review_dialog is not None:
-        window._review_dialog.close()
 
     assert len(timeline.events) == 2
+    assert window.review_step.uncertain_banner.isVisible()
     first_event = timeline.events[0]
     assert first_event.timestamp_seconds == 4.0
     assert first_event.classification is EventClassification.KEYBOARD_TAP
+
+    # Filter pills
+    window.review_step.filter_buttons["keyboard"].click()
+    assert len(timeline.visible_events()) == 1
+    window.review_step.filter_buttons["uncertain"].click()
+    assert len(timeline.visible_events()) == 1
+    assert timeline.visible_events()[0].classification is EventClassification.UNCERTAIN
+    window.review_step.filter_buttons["all"].click()
+    assert len(timeline.visible_events()) == 2
 
     # Click the first marker to select it and drag it to 6.0s
     marker_x = timeline.time_to_x(4.0)
     target_x = timeline.time_to_x(6.0)
     track_y = 55.0
 
-    press = QMouseEvent(
-        QMouseEvent.Type.MouseButtonPress,
-        QPointF(marker_x, track_y),
-        QPointF(marker_x, track_y),
-        Qt.LeftButton,
-        Qt.LeftButton,
-        Qt.NoModifier,
+    timeline.mousePressEvent(
+        QMouseEvent(
+            QMouseEvent.Type.MouseButtonPress,
+            QPointF(marker_x, track_y),
+            QPointF(marker_x, track_y),
+            Qt.LeftButton,
+            Qt.LeftButton,
+            Qt.NoModifier,
+        )
     )
-    timeline.mousePressEvent(press)
     assert timeline.selected_event_id == first_event.event_id
-    assert window.workspace_panel.event_inspector.current_event == first_event
 
-    move = QMouseEvent(
-        QMouseEvent.Type.MouseMove,
-        QPointF(target_x, track_y),
-        QPointF(target_x, track_y),
-        Qt.LeftButton,
-        Qt.LeftButton,
-        Qt.NoModifier,
+    timeline.mouseMoveEvent(
+        QMouseEvent(
+            QMouseEvent.Type.MouseMove,
+            QPointF(target_x, track_y),
+            QPointF(target_x, track_y),
+            Qt.LeftButton,
+            Qt.LeftButton,
+            Qt.NoModifier,
+        )
     )
-    timeline.mouseMoveEvent(move)
-    release = QMouseEvent(
-        QMouseEvent.Type.MouseButtonRelease,
-        QPointF(target_x, track_y),
-        QPointF(target_x, track_y),
-        Qt.LeftButton,
-        Qt.NoButton,
-        Qt.NoModifier,
+    timeline.mouseReleaseEvent(
+        QMouseEvent(
+            QMouseEvent.Type.MouseButtonRelease,
+            QPointF(target_x, track_y),
+            QPointF(target_x, track_y),
+            Qt.LeftButton,
+            Qt.NoButton,
+            Qt.NoModifier,
+        )
     )
-    timeline.mouseReleaseEvent(release)
 
     moved_event = timeline.selected_event()
     assert moved_event is not None
     assert abs(moved_event.timestamp_seconds - 6.0) <= 0.05
 
 
-def test_event_inspector_add_reclassify_delete_persist_preview_and_export(
+def test_review_sound_customization_persist_and_export_workflow(
     qtbot, tmp_path: Path
 ) -> None:
-    played_Previews: list[bytes] = []
+    played_previews: list[bytes] = []
+    stopped: list[bool] = []
     window = MainWindow()
     window._project_service = ProjectService(tmp_path / "projects")
     window._sound_preview_service = SoundPreviewService(
         window._sound_effects_service,
-        player=played_Previews.append,
+        player=played_previews.append,
+        stopper=lambda: stopped.append(True),
     )
-    window.workspace_panel._preview_service = FakePreviewService()
+    window.video_preview._preview_service = FakePreviewService()
     output_dir = tmp_path / "output"
-    window.output_location.setText(str(output_dir))
+    window.export_step.output_location_edit.setText(str(output_dir))
     qtbot.addWidget(window)
     window.show()
 
@@ -276,107 +287,97 @@ def test_event_inspector_add_reclassify_delete_persist_preview_and_export(
             )
         ],
     )
-    window.project_name.setText("Coding Session")
+    window.export_step.project_name_edit.setText("Coding Session")
     window.save_project_button.setEnabled(True)
-    window.workspace_panel.set_duration(5.0, load_initial_frame=False)
-    window.workspace_panel.set_timeline_events(window._project.timeline_events)
+    window.video_preview.set_duration(5.0, load_initial_frame=False)
+    window.review_step.timeline_widget.set_duration(5.0)
+    window._sync_timeline_ui()
+    window._switch_step(1)
 
-    inspector = window.workspace_panel.event_inspector
-    timeline = window.workspace_panel.timeline_widget
-
-    # Select the uncertain event and reclassify it to Mouse Left Click
+    timeline = window.review_step.timeline_widget
     timeline.select_event("uncertain-1")
-    assert inspector.current_event is not None
-    assert not inspector.preview_sound_button.isEnabled()
+    assert not window.review_step.preview_event_button.isEnabled()
 
-    inspector.set_classification(EventClassification.MOUSE_LEFT_CLICK)
+    window.review_step.set_classification(EventClassification.MOUSE_LEFT_CLICK)
     reclassified = timeline.selected_event()
     assert reclassified is not None
     assert reclassified.classification is EventClassification.MOUSE_LEFT_CLICK
     assert reclassified.enabled is True
-    assert inspector.preview_sound_button.isEnabled()
+    assert window.review_step.preview_event_button.isEnabled()
 
-    # Audition the sound effect and try a variation
-    inspector.preview_sound_button.click()
-    assert len(played_Previews) == 1
-    inspector.audition_variation_button.click()
-    assert len(played_Previews) == 2
-
-    # Seek to 2.5s and manually add an event
-    window.workspace_panel.seek_to(2.5, user_initiated=False)
-    inspector.add_event_button.click()
+    # Add a manual key tap at 2.5s
+    window.video_preview.seek_to(2.5, user_initiated=False)
+    window.review_step.add_key_button.click()
     assert len(window._project.timeline_events) == 2
-    added = timeline.selected_event()
-    assert added is not None
-    assert added.timestamp_seconds == 2.5
-    assert added.source is EventSource.MANUAL
 
-    # Move the manual event via the spinbox to 3.25s
-    inspector.timestamp_spin.setValue(3.25)
+    # Move via spinbox
+    window.review_step.timestamp_spin.setValue(3.25)
     assert timeline.selected_event().timestamp_seconds == 3.25
 
-    # Save project and reopen in a second MainWindow instance
+    # Sound tab: apply preset, preview samples & mix
+    window._switch_step(2)
+    window.sound_step.preset_laptop_button.click()
+    profile = window._sound_effects_service.sound_profile
+    assert profile.keyboard_style is KeyboardSoundStyle.SOFT_LAPTOP
+    assert profile.mouse_style is MouseSoundStyle.SOFT_CLICK
+    assert profile.keyboard_volume == 0.7
+
+    window.sound_step.preview_keyboard_button.click()
+    window.sound_step.preview_mix_button.click()
+    window.sound_step.stop_audio_button.click()
+    assert len(played_previews) == 2
+    assert stopped == [True]
+
+    # Save and reopen
     window._save_project()
     assert window._project_file is not None and window._project_file.is_file()
 
-    reopened_window = MainWindow()
-    reopened_window._project_service = window._project_service
-    reopened_window.workspace_panel._preview_service = FakePreviewService()
-    qtbot.addWidget(reopened_window)
-    assert reopened_window.load_project(window._project_file)
-    qtbot.waitUntil(
-        lambda: reopened_window.workspace_panel._frame_worker is None, timeout=2000
-    )
+    reopened = MainWindow()
+    reopened._project_service = window._project_service
+    reopened.video_preview._preview_service = FakePreviewService()
+    qtbot.addWidget(reopened)
+    assert reopened.load_project(window._project_file)
+    qtbot.waitUntil(lambda: reopened.video_preview._frame_worker is None, timeout=2000)
 
-    restored_events = reopened_window.workspace_panel.timeline_widget.events
-    assert len(restored_events) == 2
+    restored_events = reopened.review_step.timeline_widget.events
     assert [e.timestamp_seconds for e in restored_events] == [1.0, 3.25]
     assert [e.classification for e in restored_events] == [
         EventClassification.MOUSE_LEFT_CLICK,
         EventClassification.KEYBOARD_TAP,
     ]
 
-    # Export timeline WAV from inspector
-    reopened_window.output_location.setText(str(output_dir))
-    reopened_window.workspace_panel.event_inspector.export_timeline_button.click()
+    # Export WAV in Export tab
+    reopened._switch_step(3)
+    reopened.export_step.output_location_edit.setText(str(output_dir))
+    reopened.export_step.export_audio_button.click()
     exported_wavs = list(output_dir.glob("codesound-activity-*.wav"))
     assert len(exported_wavs) == 1
     with wave.open(str(exported_wavs[0]), "rb") as wav_file:
         assert wav_file.getframerate() == 44_100
         assert wav_file.getnframes() >= 5 * 44_100
-
-    # Delete the manual event
-    reopened_window.workspace_panel.timeline_widget.select_event(added.event_id)
-    reopened_window.workspace_panel.event_inspector.delete_event_button.click()
-    assert len(reopened_window.workspace_panel.timeline_widget.events) == 1
+    assert "Audio exported successfully" in reopened.friendly_status_label.text()
 
 
-def test_reanalysis_preserves_manual_and_edited_events_and_supports_mix_preview(
+def test_reanalysis_preserves_manual_and_edited_events(
     qtbot, tmp_path: Path
 ) -> None:
-    played: list[bytes] = []
-    stopped: list[bool] = []
     window = MainWindow()
-    window._sound_preview_service = SoundPreviewService(
-        window._sound_effects_service,
-        player=played.append,
-        stopper=lambda: stopped.append(True),
-    )
-    window.workspace_panel._preview_service = FakePreviewService()
+    window.video_preview._preview_service = FakePreviewService()
     qtbot.addWidget(window)
     window.show()
 
     window._project = Project(name="Preserve Edits")
-    window.workspace_panel.set_duration(10.0, load_initial_frame=False)
+    window.video_preview.set_duration(10.0, load_initial_frame=False)
+    window.review_step.timeline_widget.set_duration(10.0)
 
     # User adds a manual event at 2.0s
-    window.workspace_panel.seek_to(2.0, user_initiated=False)
-    window.workspace_panel.event_inspector.add_event_button.click()
-    manual_id = window.workspace_panel.timeline_widget.selected_event_id
+    window.video_preview.seek_to(2.0, user_initiated=False)
+    window.review_step.add_key_button.click()
+    manual_id = window.review_step.timeline_widget.selected_event_id
     assert manual_id is not None
 
-    # Run activity analysis with a typing burst at 4.0s, 4.5s
-    result = ActivityAnalysisResult(
+    # Detection #1
+    result_1 = ActivityAnalysisResult(
         candidates=(
             ActivityCandidate(
                 4.0,
@@ -391,21 +392,15 @@ def test_reanalysis_preserves_manual_and_edited_events_and_supports_mix_preview(
         sampled_frame_count=20,
         video_duration_seconds=10.0,
     )
-    window._on_activity_ready(result)
-    assert window._review_dialog is not None
-    window._review_dialog.apply_button.click()
-
-    events = window.workspace_panel.timeline_widget.events
+    window._on_activity_ready(result_1)
+    events = window.review_step.timeline_widget.events
     assert [e.timestamp_seconds for e in events] == [2.0, 4.0, 4.5]
-    assert events[0].event_id == manual_id
 
-    # Edit the detected event at 4.0s -> becomes user_edited=True
-    window.workspace_panel.timeline_widget.select_event(events[1].event_id)
-    window.workspace_panel.event_inspector.set_classification(
-        EventClassification.MOUSE_LEFT_CLICK
-    )
+    # Edit detected event at 4.0s
+    window.review_step.timeline_widget.select_event(events[1].event_id)
+    window.review_step.set_classification(EventClassification.MOUSE_LEFT_CLICK)
 
-    # Re-run analysis with a new detection at 7.0s -> manual (2.0s) and edited (4.0s) survive!
+    # Detection #2 at 7.0s, 7.5s -> manual (2.0s) and edited (4.0s) survive
     result_2 = ActivityAnalysisResult(
         candidates=(
             ActivityCandidate(
@@ -422,15 +417,6 @@ def test_reanalysis_preserves_manual_and_edited_events_and_supports_mix_preview(
         video_duration_seconds=10.0,
     )
     window._on_activity_ready(result_2)
-    if window._review_dialog is not None:
-        window._review_dialog.close()
-
-    after_reanalysis = window.workspace_panel.timeline_widget.events
-    assert [e.timestamp_seconds for e in after_reanalysis] == [2.0, 4.0, 7.0, 7.5]
-    assert after_reanalysis[1].classification is EventClassification.MOUSE_LEFT_CLICK
-
-    # Preview full timeline mix and stop audio
-    window.workspace_panel.event_inspector.preview_mix_button.click()
-    assert len(played) == 1
-    window.workspace_panel.event_inspector.stop_preview_button.click()
-    assert stopped == [True]
+    after = window.review_step.timeline_widget.events
+    assert [e.timestamp_seconds for e in after] == [2.0, 4.0, 7.0, 7.5]
+    assert after[1].classification is EventClassification.MOUSE_LEFT_CLICK

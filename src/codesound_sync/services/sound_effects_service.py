@@ -14,7 +14,7 @@ from typing import Iterable, Iterator
 
 from codesound_sync.config import AUDIO_SAMPLE_RATE
 from codesound_sync.models.sound_event import SoundEvent, SoundEventType
-from codesound_sync.services.sound_generator import SoundGenerator
+from codesound_sync.services.sound_generator import SoundGenerator, SoundProfile
 
 _MAX_WAV_FRAMES = (2**32 - 1 - 36) // 2
 _MIX_BLOCK_FRAMES = 16_384
@@ -42,6 +42,14 @@ class SoundEffectsService:
         if self._generator.sample_rate != sample_rate:
             raise ValueError("Generator sample rate must match renderer sample rate.")
         self.sample_rate = sample_rate
+
+    @property
+    def sound_profile(self) -> SoundProfile:
+        return self._generator.profile
+
+    @sound_profile.setter
+    def sound_profile(self, profile: SoundProfile) -> None:
+        self._generator.profile = profile
 
     def render(
         self,

@@ -33,22 +33,19 @@ class ActivityReviewDialog(QDialog):
 
         layout = QVBoxLayout(self)
         summary = QLabel(
-            f"Found {len(result.candidates)} candidate event(s) from "
-            f"{result.sampled_frame_count} sampled frames at "
-            f"{result.sample_interval_seconds:g}s intervals."
+            f"Detected {len(result.candidates)} activity moment(s) in your video."
         )
         layout.addWidget(summary)
         note = QLabel(
-            "Visual changes are estimates, not proof of keypresses or clicks. "
-            "Applying candidates merges them onto the timeline while preserving your "
-            "manual and edited events."
+            "Choose which detected moments to add to your timeline. "
+            "Your manually added and edited events will be kept."
         )
         note.setWordWrap(True)
         layout.addWidget(note)
 
         self.table = QTableWidget(len(result.candidates), 5)
         self.table.setHorizontalHeaderLabels(
-            ["Include", "Timestamp", "Candidate", "Confidence", "Evidence"]
+            ["Include", "Time", "Type", "Confidence", "Details"]
         )
         self.table.setSelectionBehavior(QTableWidget.SelectRows)
         self.table.setEditTriggers(QTableWidget.NoEditTriggers)

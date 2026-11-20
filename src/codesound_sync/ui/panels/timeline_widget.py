@@ -12,17 +12,19 @@ from PySide6.QtWidgets import QSizePolicy, QWidget
 from codesound_sync.models.timeline_event import EventClassification, TimelineEvent
 from codesound_sync.services.video_preview_service import format_timestamp
 
-_LEFT_MARGIN = 16.0
-_RIGHT_MARGIN = 16.0
+_LEFT_MARGIN = 28.0
+_RIGHT_MARGIN = 28.0
 _RULER_HEIGHT = 26.0
 _MARKER_HIT_RADIUS_PX = 7.0
 
 _CLASSIFICATION_COLOURS: dict[EventClassification, str] = {
-    EventClassification.KEYBOARD_TAP: "#3478e8",
-    EventClassification.MOUSE_LEFT_CLICK: "#57b87b",
-    EventClassification.MOUSE_RIGHT_CLICK: "#48b5c4",
-    EventClassification.UNCERTAIN: "#f5c842",
+    EventClassification.KEYBOARD_TAP: "#3b82f6",
+    EventClassification.MOUSE_LEFT_CLICK: "#22c55e",
+    EventClassification.MOUSE_RIGHT_CLICK: "#14b8a6",
+    EventClassification.UNCERTAIN: "#f59e0b",
 }
+
+_VALID_FILTERS = ("all", "keyboard", "mouse", "uncertain")
 
 
 class TimelineWidget(QWidget):
@@ -36,13 +38,14 @@ class TimelineWidget(QWidget):
     def __init__(self, parent=None) -> None:
         super().__init__(parent)
         self.setObjectName("timelineWidget")
-        self.setMinimumHeight(88)
+        self.setMinimumHeight(96)
         self.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
         self.setFocusPolicy(Qt.StrongFocus)
 
         self._duration_seconds: float = 0.0
         self._playhead_seconds: float = 0.0
         self._events: list[TimelineEvent] = []
+        self._filter_mode: str = "all"
         self._selected_event_id: str | None = None
         self._dragging_event_id: str | None = None
         self._scrubbing_playhead: bool = False
@@ -71,6 +74,40 @@ class TimelineWidget(QWidget):
     @property
     def events(self) -> tuple[TimelineEvent, ...]:
         return tuple(self._events)
+
+    @property
+    def filter_mode(self) -> str:
+        return self._filter_mode
+
+    def set_filter(self, mode: str) -> None:
+        """Filter visible markers by 'all', 'keyboard', 'mouse', or 'uncertain'."""
+        normalized = mode.lower().strip()
+        if normalized not in _VALID_FILTERS:
+            raise ValueError(f"Unsupported timeline filter: {mode!r}")
+        self._filter_mode = normalized
+        self.update()
+
+    def visible_events(self) -> list[TimelineEvent]:
+        """Return events matching the active filter mode."""
+        if self._filter_mode == "all":
+            return list(self._events)
+        if self._filter_mode == "keyboard":
+            return [
+                e for e in self._events
+                if e.classification is EventClassification.KEYBOARD_TAP
+            ]
+        if self._filter_mode == "mouse":
+            return [
+                e for e in self._events
+                if e.classification in (
+                    EventClassification.MOUSE_LEFT_CLICK,
+                    EventClassification.MOUSE_RIGHT_CLICK,
+                )
+            ]
+        return [
+            e for e in self._events
+            if e.classification is EventClassification.UNCERTAIN
+        ]
 
     @property
     def selected_event_id(self) -> str | None:
@@ -173,7 +210,7 @@ class TimelineWidget(QWidget):
     def _candidates_near_x(self, x: float) -> list[TimelineEvent]:
         matches = [
             event
-            for event in self._events
+            for event in self.visible_events()
             if abs(self.time_to_x(event.timestamp_seconds) - x) <= _MARKER_HIT_RADIUS_PX
         ]
         matches.sort(
@@ -306,11 +343,11 @@ class TimelineWidget(QWidget):
 
         span = self.effective_duration
         if span <= 0.0:
-            painter.setPen(QColor("#7d8796"))
+            painter.setPen(QColor("#8a95a5"))
             painter.drawText(
                 track_rect,
                 Qt.AlignCenter,
-                "Timeline ready — import a video or open a project to view and edit events",
+                "Import a video and detect activity to see your sound timeline",
             )
             painter.end()
             return
@@ -333,12 +370,12 @@ class TimelineWidget(QWidget):
             )
             tick_time += step
 
-        # Draw event markers
-        for item in self._events:
+        # Draw event markers (keyboard = bar, mouse = diamond, uncertain = dashed)
+        for item in self.visible_events():
             mx = self.time_to_x(item.timestamp_seconds)
             is_selected = item.event_id == self._selected_event_id
             base_hex = _CLASSIFICATION_COLOURS.get(
-                item.classification, "#3478e8"
+                item.classification, "#3b82f6"
             )
             marker_color = QColor(base_hex if item.enabled else "#5c6573")
 
@@ -360,14 +397,47 @@ class TimelineWidget(QWidget):
                 QPointF(mx, track_rect.bottom() - 3.0),
             )
 
-            # Marker cap
-            cap_radius = 5.0 if is_selected else 4.0
-            cap_center = QPointF(mx, track_rect.center().y())
-            painter.setPen(
-                QPen(QColor("#ffffff") if is_selected else QColor("#151922"), 1.2)
-            )
-            painter.setBrush(marker_color)
-            painter.drawEllipse(cap_center, cap_radius, cap_radius)
+            if item.classification in (
+                EventClassification.MOUSE_LEFT_CLICK,
+                EventClassification.MOUSE_RIGHT_CLICK,
+            ):
+                # Mouse clicks: distinct diamond marker in upper-middle lane
+                cy = track_rect.top() + track_rect.height() * 0.34
+                r = 5.5 if is_selected else 4.5
+                diamond = QPainterPath()
+                diamond.moveTo(mx, cy - r)
+                diamond.lineTo(mx + r, cy)
+                diamond.lineTo(mx, cy + r)
+                diamond.lineTo(mx - r, cy)
+                diamond.closeSubpath()
+                painter.setPen(
+                    QPen(QColor("#ffffff") if is_selected else QColor("#151922"), 1.2)
+                )
+                painter.setBrush(marker_color)
+                painter.drawPath(diamond)
+            elif item.classification is EventClassification.UNCERTAIN:
+                # Uncertain: hollow amber ring
+                cy = track_rect.center().y()
+                r = 4.5 if is_selected else 3.8
+                painter.setPen(
+                    QPen(QColor("#ffffff") if is_selected else marker_color, 1.6)
+                )
+                painter.setBrush(QColor("#1b202b"))
+                painter.drawEllipse(QPointF(mx, cy), r, r)
+            else:
+                # Keyboard tap: rounded key-cap marker in lower-middle lane
+                cy = track_rect.top() + track_rect.height() * 0.65
+                w = 7.0 if is_selected else 5.5
+                h = 10.0 if is_selected else 8.0
+                painter.setPen(
+                    QPen(QColor("#ffffff") if is_selected else QColor("#151922"), 1.1)
+                )
+                painter.setBrush(marker_color)
+                painter.drawRoundedRect(
+                    QRectF(mx - w / 2.0, cy - h / 2.0, w, h),
+                    2.0,
+                    2.0,
+                )
 
         # Draw playhead
         px = self.time_to_x(self._playhead_seconds)

@@ -2,16 +2,79 @@
 
 from __future__ import annotations
 
+from dataclasses import dataclass
+from enum import Enum
 import math
+import random
 
 from codesound_sync.config import AUDIO_SAMPLE_RATE
 from codesound_sync.models.sound_event import SoundEventType
 
 
+class KeyboardSoundStyle(str, Enum):
+    """Selectable keyboard synthesis profiles."""
+
+    MECHANICAL_CRISP = "mechanical_crisp"
+    SOFT_LAPTOP = "soft_laptop"
+    WARM_STUDIO = "warm_studio"
+
+    @property
+    def label(self) -> str:
+        return {
+            KeyboardSoundStyle.MECHANICAL_CRISP: "Crisp Mechanical",
+            KeyboardSoundStyle.SOFT_LAPTOP: "Soft Laptop",
+            KeyboardSoundStyle.WARM_STUDIO: "Warm Studio",
+        }[self]
+
+    @property
+    def description(self) -> str:
+        return {
+            KeyboardSoundStyle.MECHANICAL_CRISP: "Bright, tactile keystrokes with clear switch snap.",
+            KeyboardSoundStyle.SOFT_LAPTOP: "Gentle, low-profile scissor-switch taps for subtle background audio.",
+            KeyboardSoundStyle.WARM_STUDIO: "Deeper, rounded keycap thock suited for voiceover tutorials.",
+        }[self]
+
+
+class MouseSoundStyle(str, Enum):
+    """Selectable mouse-click synthesis profiles."""
+
+    CRISP_SWITCH = "crisp_switch"
+    SOFT_CLICK = "soft_click"
+
+    @property
+    def label(self) -> str:
+        return {
+            MouseSoundStyle.CRISP_SWITCH: "Crisp Switch",
+            MouseSoundStyle.SOFT_CLICK: "Soft Click",
+        }[self]
+
+    @property
+    def description(self) -> str:
+        return {
+            MouseSoundStyle.CRISP_SWITCH: "Defined micro-switch press and release transient.",
+            MouseSoundStyle.SOFT_CLICK: "Softer, dampened click that blends lightly under narration.",
+        }[self]
+
+
+@dataclass(frozen=True)
+class SoundProfile:
+    """User-facing sound customization settings."""
+
+    keyboard_style: KeyboardSoundStyle = KeyboardSoundStyle.MECHANICAL_CRISP
+    mouse_style: MouseSoundStyle = MouseSoundStyle.CRISP_SWITCH
+    keyboard_volume: float = 1.0
+    mouse_volume: float = 1.0
+    human_variation: bool = True
+
+
 class SoundGenerator:
     """Generate short, local effects without third-party audio assets."""
 
-    def __init__(self, sample_rate: int = AUDIO_SAMPLE_RATE) -> None:
+    def __init__(
+        self,
+        sample_rate: int = AUDIO_SAMPLE_RATE,
+        profile: SoundProfile | None = None,
+    ) -> None:
         if (
             isinstance(sample_rate, bool)
             or not isinstance(sample_rate, int)
@@ -19,12 +82,14 @@ class SoundGenerator:
         ):
             raise ValueError("Sample rate must be an integer from 8000 to 192000 Hz.")
         self.sample_rate = sample_rate
+        self.profile = profile or SoundProfile()
 
     def generate(
         self,
         event_type: SoundEventType,
         intensity: float = 1.0,
         variation: float = 0.0,
+        profile: SoundProfile | None = None,
     ) -> list[float]:
         """Synthesize one event as normalized floating-point mono samples."""
         try:
@@ -47,6 +112,8 @@ class SoundGenerator:
         ):
             raise ValueError("Event variation must be a finite number from -1 to 1.")
 
+        active_profile = profile or self.profile
+
         if event_type is SoundEventType.KEYBOARD_TAP:
             duration = 0.048 * (1.0 + 0.14 * variation)
             body_freq = 240.0 * (1.0 + 0.12 * variation)
@@ -55,6 +122,19 @@ class SoundGenerator:
             click_decay = 0.0045
             noise_mix = 0.42
             second_tap_delay = None
+            volume_scale = active_profile.keyboard_volume
+            if active_profile.keyboard_style is KeyboardSoundStyle.SOFT_LAPTOP:
+                duration *= 0.85
+                body_freq *= 0.85
+                click_freq *= 0.72
+                click_decay = 0.0032
+                noise_mix = 0.25
+            elif active_profile.keyboard_style is KeyboardSoundStyle.WARM_STUDIO:
+                duration *= 1.08
+                body_freq *= 0.76
+                click_freq *= 0.68
+                body_decay = 0.014
+                noise_mix = 0.30
         elif event_type is SoundEventType.MOUSE_LEFT_CLICK:
             duration = 0.060
             body_freq = 320.0 * (1.0 + 0.08 * variation)
@@ -63,6 +143,11 @@ class SoundGenerator:
             click_decay = 0.004
             noise_mix = 0.48
             second_tap_delay = 0.016
+            volume_scale = active_profile.mouse_volume
+            if active_profile.mouse_style is MouseSoundStyle.SOFT_CLICK:
+                click_freq *= 0.72
+                noise_mix = 0.24
+                click_decay = 0.0032
         else:
             duration = 0.072
             body_freq = 210.0 * (1.0 + 0.08 * variation)
@@ -71,8 +156,11 @@ class SoundGenerator:
             click_decay = 0.0055
             noise_mix = 0.44
             second_tap_delay = 0.020
-
-        import random
+            volume_scale = active_profile.mouse_volume
+            if active_profile.mouse_style is MouseSoundStyle.SOFT_CLICK:
+                click_freq *= 0.75
+                noise_mix = 0.24
+                click_decay = 0.0042
 
         rng = random.Random(
             f"{event_type.value}:{round(float(variation), 4)}"
@@ -113,5 +201,6 @@ class SoundGenerator:
 
         if peak == 0.0:
             return samples
-        output_gain = 0.28 * float(intensity) / peak
+        clamped_volume = max(0.0, min(1.0, float(volume_scale)))
+        output_gain = 0.28 * float(intensity) * clamped_volume / peak
         return [sample * output_gain for sample in samples]

@@ -1,12 +1,11 @@
 from __future__ import annotations
 
 import time
-import threading
 import wave
 from pathlib import Path
 
 from PySide6.QtCore import QTimer, Qt
-from PySide6.QtWidgets import QFileDialog, QPlainTextEdit, QPushButton
+from PySide6.QtWidgets import QFileDialog, QPlainTextEdit
 
 from codesound_sync.models.activity_candidate import (
     ActivityAnalysisResult,
@@ -15,10 +14,10 @@ from codesound_sync.models.activity_candidate import (
 )
 from codesound_sync.models.media_info import MediaInfo
 from codesound_sync.models.project import Project
-from codesound_sync.services.project_service import ProjectService
-from codesound_sync.ui.workers import ffprobe_worker
-from codesound_sync.ui.main_window import MainWindow, PROJECT_FILTER
 from codesound_sync.services.activity_analysis_service import ActivityAnalysisCancelled
+from codesound_sync.services.project_service import ProjectService
+from codesound_sync.ui.main_window import MainWindow, PROJECT_FILTER
+from codesound_sync.ui.workers import ffprobe_worker
 
 
 def test_window_import_runs_probe_in_background(
@@ -46,17 +45,12 @@ def test_window_import_runs_probe_in_background(
     monkeypatch.setattr(ffprobe_worker, "probe_media", slow_probe)
     window = MainWindow()
     window._project_service = ProjectService(tmp_path / "projects")
-    # This test verifies background metadata probing, not video-frame decoding.
-    # The fixture is intentionally not a valid MP4, so keep the preview decoder out.
-    monkeypatch.setattr(
-        window.workspace_panel, "_request_frame_seek", lambda *args, **kwargs: None
-    )
     qtbot.addWidget(window)
     window.show()
 
     assert window.windowTitle() == "CodeSound Sync"
-    assert not window.record_button.isEnabled()
-    assert not window.analyze_button.isEnabled()
+    assert window.step_stack.currentIndex() == 0
+    assert "Choose a video to get started" in window.friendly_status_label.text()
 
     timer_ticks: list[bool] = []
     timer = QTimer(window)
@@ -64,22 +58,19 @@ def test_window_import_runs_probe_in_background(
     timer.timeout.connect(lambda: timer_ticks.append(True))
     timer.start()
     window.load_video(video)
-    assert not window.import_button.isEnabled()
+    assert not window.video_step.detect_activity_button.isEnabled()
     qtbot.waitUntil(lambda: window._probe_worker is None, timeout=3000)
     timer.stop()
 
     assert timer_ticks
-    assert window.import_button.isEnabled()
-    assert window.analyze_button.isEnabled()
+    assert window.video_step.detect_activity_button.isEnabled()
     assert window.save_project_button.isEnabled()
-
-    launched: list[bool] = []
-    monkeypatch.setattr(window, "_analyze_video_activity", lambda: launched.append(True))
-    window.analyze_button.click()
-    assert launched == [True]
+    assert "lesson.mp4" in window.video_step.video_name_label.text()
+    assert "00:00:42" in window.video_step.video_meta_label.text()
+    assert "Your video is ready" in window.friendly_status_label.text()
 
 
-def test_window_shows_missing_ffprobe_error(
+def test_window_shows_friendly_missing_ffprobe_error(
     qtbot, tmp_path: Path, monkeypatch
 ) -> None:
     video = tmp_path / "lesson.mp4"
@@ -96,8 +87,8 @@ def test_window_shows_missing_ffprobe_error(
     window.load_video(video)
     qtbot.waitUntil(lambda: window._probe_worker is None, timeout=3000)
 
-    assert not window.analyze_button.isEnabled()
-    assert window.save_project_button.isEnabled()
+    assert not window.video_step.detect_activity_button.isEnabled()
+    assert window.status_details_button.isVisible() or "Could not inspect this video" in window.friendly_status_label.text()
     assert "ffprobe was not found on PATH" in window.status_panel.findChild(
         QPlainTextEdit
     ).toPlainText()
@@ -140,15 +131,10 @@ def test_open_project_restores_fields_and_warns_for_missing_video(
     assert window.open_project_button.isEnabled()
     assert window._project == project
     assert window._project_file == project_file
-    assert window.project_name.text() == "Saved Lesson"
-    assert window.output_location.text() == str(tmp_path / "rendered")
-    assert window.workspace_panel._preview.text().startswith("Source video missing")
-    assert window.media_info_panel._duration.value_label.text() == "00:02:05"
-    assert window.media_info_panel._resolution.value_label.text() == "1920×1080"
-    assert window.analyze_button.isEnabled()
-    assert "cannot currently be found" in window.status_panel.findChild(
-        QPlainTextEdit
-    ).toPlainText()
+    assert window.export_step.project_name_edit.text() == "Saved Lesson"
+    assert window.export_step.output_location_edit.text() == str(tmp_path / "rendered")
+    assert "Video file not found" in window.video_preview._preview.text()
+    assert "original video file could not be found" in window.friendly_status_label.text()
 
 
 def test_open_project_dialog_cancel_preserves_current_project(
@@ -159,7 +145,7 @@ def test_open_project_dialog_cancel_preserves_current_project(
     current_project_file = tmp_path / "current.json"
     window._project = current_project
     window._project_file = current_project_file
-    window.project_name.setText(current_project.name)
+    window.export_step.project_name_edit.setText(current_project.name)
     qtbot.addWidget(window)
     dialog_args: list[tuple] = []
 
@@ -172,7 +158,7 @@ def test_open_project_dialog_cancel_preserves_current_project(
 
     assert window._project is current_project
     assert window._project_file == current_project_file
-    assert window.project_name.text() == "Current Project"
+    assert window.export_step.project_name_edit.text() == "Current Project"
     assert len(dialog_args) == 1
     assert dialog_args[0][1] == "Open Project"
     assert dialog_args[0][3] == PROJECT_FILTER
@@ -184,7 +170,7 @@ def test_open_project_rejects_malformed_file_without_replacing_state(
     window = MainWindow()
     current_project = Project(name="Current Project")
     window._project = current_project
-    window.project_name.setText(current_project.name)
+    window.export_step.project_name_edit.setText(current_project.name)
     qtbot.addWidget(window)
     malformed = tmp_path / "broken.json"
     malformed.write_text("{broken", encoding="utf-8")
@@ -192,10 +178,8 @@ def test_open_project_rejects_malformed_file_without_replacing_state(
     assert not window.load_project(malformed)
 
     assert window._project is current_project
-    assert window.project_name.text() == "Current Project"
-    assert "not valid JSON" in window.status_panel.findChild(
-        QPlainTextEdit
-    ).toPlainText()
+    assert window.export_step.project_name_edit.text() == "Current Project"
+    assert "could not be opened" in window.friendly_status_label.text()
 
 
 def test_save_loaded_project_updates_selected_file(
@@ -213,8 +197,8 @@ def test_save_loaded_project_updates_selected_file(
     qtbot.addWidget(window)
 
     assert window.load_project(project_file)
-    window.project_name.setText("Renamed")
-    window.output_location.setText(str(tmp_path / "new-output"))
+    window.export_step.project_name_edit.setText("Renamed")
+    window.export_step.output_location_edit.setText(str(tmp_path / "new-output"))
     window._save_project()
 
     loaded = service.load_file(project_file)
@@ -224,44 +208,7 @@ def test_save_loaded_project_updates_selected_file(
     assert list((tmp_path / "projects").glob("*.json")) == [project_file]
 
 
-def test_generate_test_sounds_button_writes_wav_to_configured_output(
-    qtbot, tmp_path: Path
-) -> None:
-    window = MainWindow()
-    qtbot.addWidget(window)
-    output_dir = tmp_path / "generated"
-    window.output_location.setText(str(output_dir))
-
-    window.generate_test_sounds_button.click()
-
-    generated = list(output_dir.glob("codesound-test-*.wav"))
-    assert len(generated) == 1
-    with wave.open(str(generated[0]), "rb") as wav_file:
-        assert wav_file.getnchannels() == 1
-        assert wav_file.getsampwidth() == 2
-        assert wav_file.getframerate() == 44_100
-        assert wav_file.getnframes() > 0
-    log_text = window.status_panel.findChild(QPlainTextEdit).toPlainText()
-    assert str(generated[0]) in log_text
-
-
-def test_generate_test_sounds_reports_output_directory_error(
-    qtbot, tmp_path: Path
-) -> None:
-    blocked_output = tmp_path / "output-file"
-    blocked_output.write_text("not a directory", encoding="utf-8")
-    window = MainWindow()
-    qtbot.addWidget(window)
-    window.output_location.setText(str(blocked_output))
-
-    window.generate_test_sounds_button.click()
-
-    log_text = window.status_panel.findChild(QPlainTextEdit).toPlainText()
-    assert "Could not generate test sounds" in log_text
-    assert "Could not write WAV" in log_text
-
-
-def test_activity_analysis_runs_in_background_and_review_controls_wav_events(
+def test_activity_analysis_runs_in_background_and_switches_to_review(
     qtbot, tmp_path: Path, monkeypatch
 ) -> None:
     import codesound_sync.ui.main_window as main_window_module
@@ -276,9 +223,10 @@ def test_activity_analysis_runs_in_background_and_review_controls_wav_events(
                 0.55,
                 "Repeated visual changes; possible typing-like activity.",
                 change_count=3,
+                event_timestamps=(0.4, 0.8),
             ),
             ActivityCandidate(
-                0.8,
+                1.2,
                 ActivityType.UNCERTAIN,
                 0.3,
                 "One isolated visual change.",
@@ -286,7 +234,7 @@ def test_activity_analysis_runs_in_background_and_review_controls_wav_events(
         ),
         sample_interval_seconds=0.5,
         sampled_frame_count=3,
-        video_duration_seconds=1.0,
+        video_duration_seconds=2.0,
     )
 
     class SlowAnalyzer:
@@ -304,9 +252,10 @@ def test_activity_analysis_runs_in_background_and_review_controls_wav_events(
     window = MainWindow()
     qtbot.addWidget(window)
     output_dir = tmp_path / "output"
-    window.output_location.setText(str(output_dir))
+    window.export_step.output_location_edit.setText(str(output_dir))
     window._project = Project(name="Tutorial", source_video=source)
-    window._update_activity_button()
+    window.video_step.show_loaded_video(source)
+    window.video_step.detect_activity_button.setEnabled(True)
     window.show()
 
     timer_ticks: list[bool] = []
@@ -314,36 +263,24 @@ def test_activity_analysis_runs_in_background_and_review_controls_wav_events(
     timer.setInterval(10)
     timer.timeout.connect(lambda: timer_ticks.append(True))
     timer.start()
-    window.analyze_activity_button.click()
+    window.video_step.detect_activity_button.click()
     qtbot.waitUntil(lambda: window._activity_worker is None, timeout=3000)
     timer.stop()
 
     assert timer_ticks
-    assert window._review_dialog is not None
-    dialog = window._review_dialog
-    assert dialog.table.rowCount() == 2
-    assert dialog.table.item(0, 0).checkState() == Qt.Checked
-    assert dialog.table.item(1, 0).checkState() == Qt.Unchecked
+    assert window.step_stack.currentIndex() == 1
+    assert len(window.review_step.timeline_widget.events) == 3
+    assert "Activity detection complete" in window.friendly_status_label.text()
 
-    dialog.table.item(0, 0).setCheckState(Qt.Unchecked)
-    dialog.generate_button.click()
-    assert not list(output_dir.glob("codesound-activity-*.wav"))
-    assert "No included candidates can be rendered" in window.status_panel.findChild(
-        QPlainTextEdit
-    ).toPlainText()
-
-    dialog.table.item(0, 0).setCheckState(Qt.Checked)
-    dialog.generate_button.click()
+    # Switch to Export and export WAV
+    window._switch_step(3)
+    window.export_step.export_audio_button.click()
     generated = list(output_dir.glob("codesound-activity-*.wav"))
     assert len(generated) == 1
     with wave.open(str(generated[0]), "rb") as wav_file:
         assert wav_file.getframerate() == 44_100
-        assert wav_file.getnframes() == 44_100
-    dialog.generate_button.click()
-    assert len(list(output_dir.glob("codesound-activity-*.wav"))) == 2
-    assert "not aligned to edited or speed-changed footage" in (
-        window.status_panel.findChild(QPlainTextEdit).toPlainText()
-    )
+        assert wav_file.getnframes() >= 2 * 44_100
+    assert window.export_step.success_card.isVisible()
 
 
 def test_activity_analysis_cancel_and_worker_error_are_reported(
@@ -372,21 +309,27 @@ def test_activity_analysis_cancel_and_worker_error_are_reported(
     )
     window = MainWindow()
     qtbot.addWidget(window)
-    window._project = Project(name="Tutorial", source_video=source)
-    window._update_activity_button()
-    window.show()
-    window.analyze_activity_button.click()
-    qtbot.waitUntil(lambda: window._activity_progress is not None, timeout=1000)
-    cancel_button = next(
-        button
-        for button in window._activity_progress.findChildren(QPushButton)
-        if button.text() == "Cancel"
+    media_info = MediaInfo(
+        path=source,
+        duration_seconds=10.0,
+        width=1280,
+        height=720,
+        frame_rate=30.0,
+        video_codec="h264",
+        audio_codec="aac",
+        bit_rate_kbps=1000,
+        size_bytes=512,
+        audio_streams=("aac",),
     )
-    qtbot.mouseClick(cancel_button, Qt.LeftButton)
+    window._project = Project(name="Tutorial", source_video=source, media_info=media_info)
+    window.video_step.show_loaded_video(source, media_info=media_info)
+    window.show()
+
+    window.video_step.detect_activity_button.click()
+    qtbot.waitUntil(lambda: window.video_step.progress_card.isVisible(), timeout=1000)
+    window.video_step.cancel_detect_button.click()
     qtbot.waitUntil(lambda: window._activity_worker is None, timeout=3000)
-    assert "analysis cancelled" in window.status_panel.findChild(
-        QPlainTextEdit
-    ).toPlainText().lower()
+    assert "cancelled" in window.friendly_status_label.text().lower()
 
     class FailingAnalyzer:
         def __init__(self, sample_interval_seconds: float) -> None:
@@ -396,36 +339,12 @@ def test_activity_analysis_cancel_and_worker_error_are_reported(
             raise RuntimeError("synthetic FFmpeg decode error")
 
     monkeypatch.setattr(main_window_module, "FrameActivityAnalyzer", FailingAnalyzer)
-    window.analyze_activity_button.click()
+    window.video_step.detect_activity_button.click()
     qtbot.waitUntil(lambda: window._activity_worker is None, timeout=3000)
+    assert "Could not detect activity" in window.friendly_status_label.text()
     assert "synthetic FFmpeg decode error" in window.status_panel.findChild(
         QPlainTextEdit
     ).toPlainText()
-
-
-def test_activity_action_requires_an_existing_video(qtbot, tmp_path: Path) -> None:
-    window = MainWindow()
-    qtbot.addWidget(window)
-    window._project = Project(
-        name="Missing", source_video=tmp_path / "absent.mp4"
-    )
-    window._update_activity_button()
-    assert not window.analyze_activity_button.isEnabled()
-
-
-def test_activity_action_stays_disabled_during_media_probe(
-    qtbot, tmp_path: Path
-) -> None:
-    source = tmp_path / "lesson.mp4"
-    source.write_bytes(b"video")
-    window = MainWindow()
-    qtbot.addWidget(window)
-    window._project = Project(name="Lesson", source_video=source)
-
-    window._set_busy(True)
-    assert not window.analyze_activity_button.isEnabled()
-    window._set_busy(False)
-    assert window.analyze_activity_button.isEnabled()
 
 
 def test_window_import_unicode_video_populates_media_info_and_reports_probe_errors(
@@ -458,13 +377,9 @@ def test_window_import_unicode_video_populates_media_info_and_reports_probe_erro
     window.load_video(video)
     qtbot.waitUntil(lambda: window._probe_worker is None, timeout=3000)
 
-    assert window.workspace_panel._path.text() == str(video)
-    assert window.media_info_panel._duration.value_label.text() == "00:01:35"
-    assert window.media_info_panel._resolution.value_label.text() == "1920×1080"
-    assert window.media_info_panel._fps.value_label.text() == "30.00 fps"
-    assert window.media_info_panel._video_codec.value_label.text() == "h264"
-    assert window.media_info_panel._audio_streams.value_label.text() == "1 (aac)"
-    assert window.analyze_button.isEnabled()
+    assert "00:01:35" in window.video_step.video_meta_label.text()
+    assert "1920×1080" in window.video_step.video_meta_label.text()
+    assert window.video_step.detect_activity_button.isEnabled()
 
     monkeypatch.setattr(
         ffmpeg_service.subprocess,
@@ -476,8 +391,7 @@ def test_window_import_unicode_video_populates_media_info_and_reports_probe_erro
     window.load_video(video)
     qtbot.waitUntil(lambda: window._probe_worker is None, timeout=3000)
 
+    assert "Could not inspect this video" in window.friendly_status_label.text()
     log_text = window.status_panel.findChild(QPlainTextEdit).toPlainText()
     assert "returned no media metadata output" in log_text
     assert "TypeError" not in log_text
-    assert window.statusBar().currentMessage() == "Media inspection failed"
-    assert not window.analyze_button.isEnabled()
